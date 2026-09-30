@@ -13,11 +13,16 @@ editing a single core file.
 
 ## Quick path
 
+**Order matters: install first, deploy second.** Guild-scoped command registration requires the
+application to be authorized in that guild with the `applications.commands` scope, and that only
+happens during installation. Deploying to a guild the bot has not been installed into fails with
+`404 Missing Access`.
+
 1. Create a Discord application and bot (see [Create the application](#create-the-application)).
-2. Copy `.env.example` to `.env` and fill in the token and application id.
+2. Copy `.env.example` to `.env` and fill in the token, application id and dev guild id.
 3. `npm install`
-4. `npm run deploy:commands` — registers the slash commands.
-5. `npm run invite` — prints the install link; open it and pick a server.
+4. `npm run invite` — prints the install link; open it, pick your server, approve.
+5. `npm run deploy:commands` — registers the slash commands in that server.
 6. `npm run dev` — start the bot, then type `/ping`.
 
 Verify it worked: `/ping` replies `Pong! Gateway heartbeat: 0 ms.` in the channel you ran it
@@ -276,7 +281,8 @@ Pure logic is separated from discord.js objects on purpose: `permissions.ts`, `r
 | `Invalid environment configuration` | No `.env`, or a variable is blank | Copy `.env.example` to `.env` and fill it in. |
 | `401: Unauthorized` when deploying | Wrong or expired `DISCORD_TOKEN` | **Bot → Reset Token**, update `.env`. |
 | `401: Unauthorized` when deploying | Token belongs to a different application | Check the app id matches `DISCORD_CLIENT_ID`. |
-| Commands missing from the picker | Bot was installed before commands existed | Run `npm run deploy:commands`, then re-open the picker. It can take a few minutes to refresh. |
+| Commands missing from the picker | Commands were never deployed, or deployed before installing | Install first (step 4), then run `npm run deploy:commands`. Guild registration returns `404 Missing Access` when the app is not authorized in the guild. |
+| `404 Missing Access` when deploying | Deploying to a guild before installing there | Install into the server with the invite link, then deploy. |
 | Commands missing globally | Global propagation delay | Set `DISCORD_DEV_GUILD_ID` to develop against one server instead. |
 | Bot installed but no commands at all | `applications.commands` scope missing | Re-run `npm run invite` and reinstall. |
 | `feature declared gateway intents that are not enabled` | Feature needs a privileged intent you have not granted | Enable the portal toggle **and** `ENABLE_PRIVILEGED_INTENTS=true`, then restart. |
