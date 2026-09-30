@@ -98,6 +98,14 @@ Parent-verified (re-run independently after the writer returned, not taken on re
 
 Versions confirmed live via `npm view`: discord.js 14.27.0, discord-api-types 0.38.56, zod 4.6.5, pino 10.3.1, vitest 5.0.3, tsx 4.23.15, dotenv 18.0.4. TypeScript pinned to `^5.9.0` (5.9.3 installed) rather than 7.x, since 7 is the freshly-rewritten native compiler.
 
+Repository initialized on branch `main` with author `DiMa-Program <martindipardo1234@gmail.com>`.
+
+Work-unit commit: `249e962c9f2aaf5e264948a71dab040c3108f6e3` — `feat: bootstrap extensible Discord bot foundation`, 27 files.
+
+Size decision: 2060 authored lines (excluding the generated `package-lock.json`) is 5x the 400-line review budget. The user chose a single honest initial commit over a 4-5 commit split, because no intermediate cut leaves the repository in a compiling, test-passing state — a commit whose tests do not run is worse than a large but truthful one. `.gitattributes` was added in the same commit to normalize LF/CRLF so Windows checkouts do not produce whole-file diffs.
+
+Rollback boundary: this commit is the repository genesis, so rollback is `git reset --hard 249e962^` on a fresh clone or deleting the repository. No later work depends on it.
+
 Not verified end-to-end: live gateway login and a real slash-command deploy both require real credentials, which are absent by design. The deploy path was exercised up to the API boundary and returned `401` on a deliberately fake token, proving discovery and auth wiring without exposing secrets.
 
 ## Accepted design deviations from the original plan
@@ -110,8 +118,8 @@ Not verified end-to-end: live gateway login and a real slash-command deploy both
 - Welcome-greeting state is in-memory and lost on restart. `greeting-store.ts` is the single swap point for a real database.
 - Global slash command deploys can take up to an hour to propagate. Set `DISCORD_DEV_GUILD_ID` while developing.
 - Shutdown deliberately does not call `process.exit` so buffered logs flush; `Client#destroy()` drains the event loop.
-- No git repository exists yet, so no work-unit commits were made. Repository initialization is the user's decision.
+- No remote is configured yet. Pushing requires the operator to authorize with GitHub interactively; agent-side credential handling is out of scope by design.
 
 ## Next step
 
-Fill in `.env` with real credentials, then `npm run invite` to install into a test server and `npm run dev` to bring the bot online.
+Fill in `.env` with real credentials, then `npm run invite` to install into a test server and `npm run dev` to bring the bot online. Add a GitHub remote and push once the operator has authorized interactively.
