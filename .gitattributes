@@ -1,0 +1,9 @@
+# Normalize line endings so Windows checkouts do not produce whole-file diffs.
+* text=auto eol=lf
+
+# Lockfiles are machine-generated; keep them out of language statistics and diffs.
+package-lock.json linguist-generated=true -diff
+
+# Keep node_modules and build output out of git's text handling entirely.
+node_modules/** -text
+dist/** -text

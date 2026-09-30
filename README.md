@@ -1,0 +1,296 @@
+# Discord bot foundation
+
+An extensible discord.js bot that installs into any server through OAuth2 using an explicit,
+least-privilege permission set, and grows by dropping a folder into `src/features/` — without
+editing a single core file.
+
+- **Least privilege by construction.** The install link requests only `SendMessages` and
+  `EmbedLinks`. `Administrator` and `Manage Server` are hard errors, not warnings.
+- **Intents are explicit.** The bot runs with no Developer Portal changes. Privileged intents
+  stay off until you ask for them, and only the ones a feature actually needs are requested.
+- **Deploy-safe.** Command deployment refuses to publish if a command exists on disk but was
+  never registered, so you cannot ship a command with no handler behind it.
+
+## Quick path
+
+1. Create a Discord application and bot (see [Create the application](#create-the-application)).
+2. Copy `.env.example` to `.env` and fill in the token and application id.
+3. `npm install`
+4. `npm run deploy:commands` — registers the slash commands.
+5. `npm run invite` — prints the install link; open it and pick a server.
+6. `npm run dev` — start the bot, then type `/ping`.
+
+Verify it worked: `/ping` replies `Pong! Gateway heartbeat: 0 ms.` in the channel you ran it
+from.
+
+## Prerequisites
+
+| Requirement | Version | Notes |
+|-------------|---------|-------|
+| Node.js | 20.9 or newer | ESM only (`"type": "module"`). Node 24 recommended. |
+| Discord account | — | Needed to create the application. |
+| A Discord server | — | Your own test server is enough. |
+
+Python is not required. Nothing is compiled to a native binary.
+
+## Create the application
+
+1. Open the [Developer Portal](https://discord.com/developers/applications) and click
+   **New Application**.
+2. Name it and create it. You land on the **General Information** page.
+3. Open the **Bot** tab and click **Add Bot**.
+4. Leave **Privileged Gateway Intents** untouched for now — see the next section.
+
+### Where the three values come from
+
+| Value | Portal location | Shape |
+|-------|-----------------|-------|
+| `DISCORD_CLIENT_ID` | **General Information → Application ID** | 17–20 digit number. `Copy` sits next to the field. |
+| `DISCORD_TOKEN` | **Bot → Reset Token** → **Copy** | Long mixed-case string. Shown once. Never commit it. |
+| `DISCORD_DEV_GUILD_ID` | Discord itself, not the portal | Right-click your server → **Copy Server ID**. Needs **Settings → Advanced → Developer Mode**. |
+
+## Configuration
+
+The bot reads secrets from the environment, loading `.env` at startup. `.env` is gitignored and
+`.env.example` is the only file you commit.
+
+| Variable | Required | Default | Meaning |
+|----------|----------|---------|---------|
+| `DISCORD_TOKEN` | yes | — | Bot token used to log in. |
+| `DISCORD_CLIENT_ID` | yes | — | Application id. Used for command deployment and the install link. |
+| `DISCORD_DEV_GUILD_ID` | no | *(unset)* | When set, commands deploy to that one server. When unset, they deploy **globally**. |
+| `LOG_LEVEL` | no | `info` | One of `trace`, `debug`, `info`, `warn`, `error`, `fatal`, `silent`. |
+| `ENABLE_PRIVILEGED_INTENTS` | no | `false` | Opt in to the privileged intents features declare. See below. |
+
+If `ENABLE_PRIVILEGED_INTENTS` is not already in your `.env`, add it with the value `false`.
+It is optional and that is the default.
+
+Misconfiguration is reported in one pass, with the fix for each variable:
+
+```
+Invalid environment configuration:
+  - DISCORD_TOKEN: is required
+      Copy .env.example to .env, then paste the token from Discord Developer Portal > Bot > Reset Token.
+  - DISCORD_CLIENT_ID: is required
+      Copy the Application ID from Discord Developer Portal > General Information > Application ID.
+```
+
+## Privileged gateway intents
+
+`Guilds` is always on. `GuildMessages` is on so message-driven features need no extra setup.
+Neither requires a portal change.
+
+Three intents are **privileged**: disabled in the portal by default, and requiring Discord
+approval once your bot is in 75 or more servers. The bot never assumes them.
+
+| Intent | Privileged | Needed by | Without it |
+|--------|-----------|-----------|------------|
+| `Guilds` | no | Everything | Bot cannot start. |
+| `GuildMessages` | no | Message-driven features (none shipped) | `messageCreate` never fires. |
+| `GuildMembers` | **yes** | `welcome` — `guildMemberAdd` | Greetings never fire. |
+| `MessageContent` | **yes** | Reading user message text | `message.content` is empty. |
+| `GuildPresences` | **yes** | Online/activity status | `presenceUpdate` never fires. |
+
+A privileged intent is requested only when **both** conditions hold:
+
+1. `ENABLE_PRIVILEGED_INTENTS=true` in `.env`, **and**
+2. a feature declares it in `requiredIntents` (see `src/features/welcome/index.ts`).
+
+Enabling only the portal toggle is not enough, and setting only the env var is not enough. When a
+feature needs an intent it does not have, the bot says so at startup instead of failing silently:
+
+```
+WARN: feature declared gateway intents that are not enabled: its event handlers will never fire
+      {"feature":"welcome","intents":"GuildMembers"}
+WARN: set ENABLE_PRIVILEGED_INTENTS=true in .env AND tick the matching toggles in
+      Discord Developer Portal > Bot > Privileged Gateway Intents
+```
+
+To enable one: **Bot → Privileged Gateway Intents**, tick **Server Members Intent**, save, then
+set `ENABLE_PRIVILEGED_INTENTS=true` in `.env` and restart.
+
+## Install into a server
+
+```bash
+npm run invite
+```
+
+```
+Install this bot into a server by opening this URL:
+
+  https://discord.com/oauth2/authorize?client_id=123456789012345678&scope=bot+applications.commands&permissions=18432
+
+Requested channel permissions:
+  - SendMessages — Reply to slash commands and post the opt-in welcome greeting.
+  - EmbedLinks — Render command replies as rich embeds instead of plain text.
+
+Deliberately not requested: Administrator, ManageGuild.
+```
+
+The script needs only `DISCORD_CLIENT_ID` — not the bot token — so you can produce the link
+before the bot has ever run. Open the URL, choose a server, and approve. The consent screen
+lists exactly the permissions above, so the server owner can see the scope before approving.
+
+`permissions=18432` is `SendMessages` (2048) `| EmbedLinks` (16384). `applications.commands` in
+the scope list is what makes slash commands appear; without it the bot installs and no command
+ever shows up.
+
+**Managing permissions without reinstalling.** `/config-greeting` requires *Manage Server* from
+the caller, but the bot is never installed with that permission. It is checked at runtime and
+also declared as the command's `default_member_permissions`, so Discord hides the command from
+members who cannot use it.
+
+## Add a new feature
+
+A feature is one folder. No core file changes, no registration step, no import to add.
+
+**1. Write the command.** Create `src/features/streak/commands/streak.ts`:
+
+```ts
+import { SlashCommandBuilder } from 'discord.js';
+import type { ChatInputCommandInteraction } from 'discord.js';
+
+export const data = new SlashCommandBuilder()
+  .setName('streak')
+  .setDescription('Show the current streak.')
+  .toJSON();
+
+export async function execute(interaction: ChatInputCommandInteraction): Promise<void> {
+  await interaction.reply({ content: 'Your streak is 0 days.' });
+}
+```
+
+**2. Declare the feature.** Create `src/features/streak/index.ts`:
+
+```ts
+import type { Feature } from '../../core/registry.js';
+import { data, execute } from './commands/streak.js';
+
+export default {
+  name: 'streak',
+  description: 'Daily activity streaks.',
+  commands: [{ data, execute }],
+} satisfies Feature;
+```
+
+**3. Deploy and run.**
+
+```bash
+npm run deploy:commands
+npm run dev
+```
+
+That is the whole extension path. The registry discovers `src/features/*/index.ts` at boot, so
+restarting is all it takes to pick the feature up.
+
+### Optional: reacting to events
+
+Add `handlers/<event>.ts` and reference it. The handler is type-checked against the event it is
+bound to, so a wrong parameter is a compile error.
+
+```ts
+// src/features/streak/handlers/member-join.ts
+import type { GuildMember } from 'discord.js';
+
+export async function handleGuildMemberAdd(member: GuildMember): Promise<void> {
+  // ...
+}
+```
+
+```ts
+export default {
+  name: 'streak',
+  commands: [{ data, execute }],
+  handlers: { guildMemberAdd: handleGuildMemberAdd },
+  requiredIntents: [GatewayIntentBits.GuildMembers], // only if you need one
+} satisfies Feature;
+```
+
+A privileged intent in `requiredIntents` is still only requested when
+`ENABLE_PRIVILEGED_INTENTS=true`, and the registry warns at boot if it is unavailable.
+
+### Optional: shared state
+
+Keep a module-scoped `Map` next to the feature, the way `src/features/welcome/greeting-store.ts`
+does. It dies with the process, which is fine while a feature is young. `src/features/*/commands/`
+files are scanned for deployment, so a shared helper belongs in the feature root, not in
+`commands/`.
+
+### The two discovery paths
+
+| Path | Reads | Used by |
+|------|-------|---------|
+| `src/features/*/index.ts` | the `commands` and `handlers` arrays | the running bot |
+| `src/features/*/commands/**/*.ts` | every file exporting `data` + `execute` | command deployment |
+
+They must agree. `npm run deploy:commands` compares them and publishes nothing if they diverge:
+
+```
+ERROR: feature manifests and the commands/ tree disagree: nothing was deployed
+```
+
+This is why step 2 is not optional: a command file that no manifest lists would otherwise be
+deployed with no handler behind it.
+
+## Scripts
+
+| Command | What it does |
+|---------|--------------|
+| `npm run dev` | Run the bot with reload on change. |
+| `npm run build` | Compile to `dist/`. |
+| `npm start` | Run the compiled `dist/index.js`. |
+| `npm run typecheck` | `tsc --noEmit` over `src/`, strict. |
+| `npm test` | Vitest unit tests. |
+| `npm run test:watch` | Vitest in watch mode. |
+| `npm run deploy:commands` | Bulk-overwrite slash commands. Guild-scoped if `DISCORD_DEV_GUILD_ID` is set, global otherwise. |
+| `npm run invite` | Print the OAuth2 install link. |
+
+**Command deployment is a bulk overwrite.** It reconciles the remote set with the local one, so
+deleting a command file removes it from Discord instead of leaving it there forever. Guild-scoped
+commands appear in about a second; global ones can take up to an hour to propagate.
+
+## Project layout
+
+```
+src/
+  index.ts                     entrypoint: load env, build client, login
+  config/env.ts                pure validation; no process.env at import time
+  core/logger.ts               pino root + child logger, redacts credentials
+  core/permissions.ts          permission set and invite-URL builder (no client needed)
+  core/registry.ts             feature discovery, wiring plan, command collection
+  client/bot.ts                client construction, intents, diagnostics, shutdown
+  scripts/deploy-commands.ts   slash command deployment
+  scripts/print-invite.ts      install-link generator
+  features/
+    ping/                      reference feature: one command
+    welcome/                   reference feature: one event handler + toggle command
+```
+
+Pure logic is separated from discord.js objects on purpose: `permissions.ts`, `registry.ts` and
+`env.ts` are all testable without a client, a token or a `.env` file.
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `Invalid environment configuration` | No `.env`, or a variable is blank | Copy `.env.example` to `.env` and fill it in. |
+| `401: Unauthorized` when deploying | Wrong or expired `DISCORD_TOKEN` | **Bot → Reset Token**, update `.env`. |
+| `401: Unauthorized` when deploying | Token belongs to a different application | Check the app id matches `DISCORD_CLIENT_ID`. |
+| Commands missing from the picker | Bot was installed before commands existed | Run `npm run deploy:commands`, then re-open the picker. It can take a few minutes to refresh. |
+| Commands missing globally | Global propagation delay | Set `DISCORD_DEV_GUILD_ID` to develop against one server instead. |
+| Bot installed but no commands at all | `applications.commands` scope missing | Re-run `npm run invite` and reinstall. |
+| `feature declared gateway intents that are not enabled` | Feature needs a privileged intent you have not granted | Enable the portal toggle **and** `ENABLE_PRIVILEGED_INTENTS=true`, then restart. |
+| Welcome greetings never appear | Greetings are off per guild | Run `/config-greeting enabled:true channel:#your-channel` as a member with Manage Server. |
+| `/config-greeting` not in the picker | Command is hidden from members without Manage Server | Expected. It is intentionally restricted. |
+| `feature manifests and the commands/ tree disagree` | A command file is not listed in its feature `index.ts` | Add it to the `commands` array, or remove the file. |
+| `duplicate command name: the first registration wins` | Two features claim the same command name | Rename one of them. |
+| `The client needs to be logged in to generate an invite link` | Calling `client.generateInvite` directly | Use `buildInstallUrl` from `src/core/permissions.ts` instead. It needs no client. |
+| `login failed` on start | `Guilds` intent missing, or token invalid | Check `DISCORD_TOKEN`; the bot always requests `Guilds`. |
+
+## Checklist
+
+- [ ] `.env` exists and `npm run typecheck` / `npm test` / `npm run build` all pass.
+- [ ] `npm run deploy:commands` completes without a disagreement error.
+- [ ] `npm run invite` prints a URL containing `permissions=18432` and no administrator bit.
+- [ ] `/ping` replies after installing.
+- [ ] `.env` is gitignored and was never committed.
