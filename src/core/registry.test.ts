@@ -1,8 +1,12 @@
 import { GatewayIntentBits } from 'discord.js';
-import { describe, expect, it } from 'vitest';
+import type { Client, Interaction } from 'discord.js';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
+  applyRegistry,
   collectSlashCommands,
+  COMMAND_FAILURE_MESSAGE,
+  createInteractionRouter,
   createRegistry,
   isFeature,
   isSlashCommand,
@@ -14,6 +18,7 @@ import {
   type Feature,
   type SlashCommandWithExecute,
 } from './registry.js';
+import type { Logger } from './logger.js';
 
 const NO_INTENTS: GatewayIntentBits[] = [];
 
@@ -26,6 +31,55 @@ function makeCommand(name: string): SlashCommandWithExecute {
 
 function makeFeature(overrides: Partial<Feature> & { name: string }): Feature {
   return { ...overrides };
+}
+
+/** A `vi.fn()` spy, named without depending on which type alias the runner happens to export. */
+type Spy = ReturnType<typeof vi.fn>;
+
+/** A logger that records instead of printing. Only `warn` and `error` matter to the router. */
+interface FakeLog {
+  readonly log: Logger;
+  readonly warn: Spy;
+  readonly error: Spy;
+}
+
+function makeLog(): FakeLog {
+  const warn = vi.fn();
+  const error = vi.fn();
+  return { log: { warn, error } as unknown as Logger, warn, error };
+}
+
+/** What a fake interaction should pretend to be, and whether it was already acknowledged. */
+interface FakeInteractionSpec {
+  readonly commandName: string;
+  readonly chatInput?: boolean;
+  readonly replied?: boolean;
+  readonly deferred?: boolean;
+}
+
+interface FakeInteraction {
+  readonly interaction: Interaction;
+  readonly reply: Spy;
+  readonly followUp: Spy;
+}
+
+/**
+ * The smallest object the router can meaningfully read: the command name, the chat-input guard and
+ * the acknowledgement flags, plus the two methods that answer the interaction.
+ */
+function makeInteraction(spec: FakeInteractionSpec): FakeInteraction {
+  const reply = vi.fn().mockResolvedValue(undefined);
+  const followUp = vi.fn().mockResolvedValue(undefined);
+  const fake = {
+    commandName: spec.commandName,
+    replied: spec.replied ?? false,
+    deferred: spec.deferred ?? false,
+    isChatInputCommand: (): boolean => spec.chatInput ?? true,
+    reply,
+    followUp,
+  };
+
+  return { interaction: fake as unknown as Interaction, reply, followUp };
 }
 
 describe('createRegistry', () => {
@@ -118,6 +172,162 @@ describe('createRegistry', () => {
     expect(plan.bindings).toEqual([]);
     expect(plan.duplicateCommands).toEqual([]);
     expect(plan.missingIntents).toEqual([]);
+  });
+});
+
+describe('createInteractionRouter', () => {
+  it('routes a chat-input interaction to its handler exactly once', async () => {
+    const execute = vi.fn();
+    const plan = createRegistry(
+      [makeFeature({ name: 'ping', commands: [{ data: { name: 'ping', description: 'p' }, execute }] })],
+      NO_INTENTS,
+    );
+    const { log } = makeLog();
+    const { interaction } = makeInteraction({ commandName: 'ping' });
+
+    await createInteractionRouter(plan, log)(interaction);
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(execute).toHaveBeenCalledWith(interaction);
+  });
+
+  it('ignores an interaction that is not a chat-input command', async () => {
+    const execute = vi.fn();
+    const plan = createRegistry(
+      [makeFeature({ name: 'ping', commands: [{ data: { name: 'ping', description: 'p' }, execute }] })],
+      NO_INTENTS,
+    );
+    const { log, warn } = makeLog();
+    const { interaction, reply, followUp } = makeInteraction({ commandName: 'ping', chatInput: false });
+
+    await createInteractionRouter(plan, log)(interaction);
+
+    expect(execute).not.toHaveBeenCalled();
+    expect(reply).not.toHaveBeenCalled();
+    expect(followUp).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('warns and stops when the command name is not in the plan', async () => {
+    const plan = createRegistry([makeFeature({ name: 'ping', commands: [makeCommand('ping')] })], NO_INTENTS);
+    const { log, warn, error } = makeLog();
+    const { interaction, reply } = makeInteraction({ commandName: 'ghost' });
+
+    // A rejection here would fail the test, which is the assertion: a miss must not crash the bot.
+    await createInteractionRouter(plan, log)(interaction);
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]?.[0]).toMatchObject({ command: 'ghost' });
+    expect(error).not.toHaveBeenCalled();
+    expect(reply).not.toHaveBeenCalled();
+  });
+
+  it('replies ephemerally when a handler throws before acknowledging', async () => {
+    const execute = vi.fn().mockRejectedValue(new Error('boom'));
+    const plan = createRegistry(
+      [makeFeature({ name: 'ping', commands: [{ data: { name: 'ping', description: 'p' }, execute }] })],
+      NO_INTENTS,
+    );
+    const { log, error } = makeLog();
+    const { interaction, reply, followUp } = makeInteraction({ commandName: 'ping' });
+
+    await createInteractionRouter(plan, log)(interaction);
+
+    expect(reply).toHaveBeenCalledTimes(1);
+    expect(reply).toHaveBeenCalledWith({
+      content: COMMAND_FAILURE_MESSAGE,
+      ephemeral: true,
+    });
+    expect(followUp).not.toHaveBeenCalled();
+    expect(error.mock.calls[0]?.[0]).toMatchObject({ command: 'ping' });
+  });
+
+  it('follows up instead of replying when the handler already acknowledged', async () => {
+    const execute = vi.fn().mockRejectedValue(new Error('boom'));
+    const plan = createRegistry(
+      [makeFeature({ name: 'ping', commands: [{ data: { name: 'ping', description: 'p' }, execute }] })],
+      NO_INTENTS,
+    );
+
+    for (const acknowledged of [{ replied: true }, { deferred: true }]) {
+      const { log } = makeLog();
+      const { interaction, reply, followUp } = makeInteraction({ commandName: 'ping', ...acknowledged });
+
+      await createInteractionRouter(plan, log)(interaction);
+
+      expect(followUp).toHaveBeenCalledTimes(1);
+      expect(followUp).toHaveBeenCalledWith({
+        content: COMMAND_FAILURE_MESSAGE,
+        ephemeral: true,
+      });
+      // A second acknowledgement is exactly what discord.js rejects.
+      expect(reply).not.toHaveBeenCalled();
+    }
+  });
+
+  it('never leaks internal error detail to the user', async () => {
+    const execute = vi.fn().mockRejectedValue(
+      new Error('ENOENT: no such file or directory, open "C:\\secrets\\.env"'),
+    );
+    const plan = createRegistry(
+      [makeFeature({ name: 'ping', commands: [{ data: { name: 'ping', description: 'p' }, execute }] })],
+      NO_INTENTS,
+    );
+    const { log } = makeLog();
+    const { interaction, reply } = makeInteraction({ commandName: 'ping' });
+
+    await createInteractionRouter(plan, log)(interaction);
+
+    const payload = reply.mock.calls[0]?.[0] as { content: string };
+    expect(payload.content).toBe(COMMAND_FAILURE_MESSAGE);
+    expect(payload.content).not.toMatch(/ENOENT|\.env|\\|Error:/);
+  });
+
+  it('leaves acknowledgement to the handler on the success path', async () => {
+    // A realistic handler: it is the one that replies.
+    const execute = vi.fn().mockImplementation(async (interaction: Interaction) => {
+      await (interaction as unknown as { reply: (payload: unknown) => Promise<void> }).reply({ content: 'Pong!' });
+    });
+    const plan = createRegistry(
+      [makeFeature({ name: 'ping', commands: [{ data: { name: 'ping', description: 'p' }, execute }] })],
+      NO_INTENTS,
+    );
+    const { log, error } = makeLog();
+    const { interaction, reply, followUp } = makeInteraction({ commandName: 'ping' });
+
+    await createInteractionRouter(plan, log)(interaction);
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(reply).toHaveBeenCalledTimes(1);
+    expect(reply).toHaveBeenCalledWith({ content: 'Pong!' });
+    expect(followUp).not.toHaveBeenCalled();
+    expect(error).not.toHaveBeenCalled();
+  });
+});
+
+describe('applyRegistry', () => {
+  it('binds an interactionCreate listener so deployed commands are actually routed', () => {
+    const plan = createRegistry([makeFeature({ name: 'ping', commands: [makeCommand('ping')] })], NO_INTENTS);
+    const { log } = makeLog();
+    const on = vi.fn();
+
+    applyRegistry({ on } as unknown as Client, plan, log);
+
+    // This is the regression guard for the reported bug: commands were deployed through
+    // `plan.commands`, but nothing ever connected that map to the gateway.
+    const events = on.mock.calls.map((call) => call[0]);
+    expect(events).toContain('interactionCreate');
+  });
+
+  it('still binds the listeners features declared', () => {
+    const handler = (): undefined => undefined;
+    const plan = createRegistry([makeFeature({ name: 'welcome', handlers: { guildMemberAdd: handler } })], NO_INTENTS);
+    const { log } = makeLog();
+    const on = vi.fn();
+
+    applyRegistry({ on } as unknown as Client, plan, log);
+
+    expect(on.mock.calls.map((call) => call[0])).toEqual(['guildMemberAdd', 'interactionCreate']);
   });
 });
 

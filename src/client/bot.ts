@@ -205,7 +205,7 @@ export function createBot(config: EnvConfig, features: readonly Feature[]): Bot 
   const plan = createRegistry(features, intents);
 
   reportPlan(log, plan, intents);
-  applyRegistry(client, plan);
+  applyRegistry(client, plan, log);
   attachDiagnostics(client, log, intents);
   const dispose = attachShutdownHandlers(client, log);
 

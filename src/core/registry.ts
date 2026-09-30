@@ -22,8 +22,11 @@ import type {
   Client,
   ClientEvents,
   GatewayIntentBits,
+  Interaction,
   RESTPostAPIApplicationCommandsJSONBody,
 } from 'discord.js';
+
+import type { Logger } from './logger.js';
 
 /**
  * A slash command: the REST payload that gets deployed, plus the handler that answers it.
@@ -149,11 +152,98 @@ export function createRegistry(
   };
 }
 
-/** Attaches every planned listener to a client. Multiple listeners per event are allowed. */
-export function applyRegistry(client: Client, plan: RegistryPlan): void {
+/**
+ * What the user is told when a command handler throws.
+ *
+ * Deliberately generic: the stack trace, the file path and the original error message go to the
+ * log, never to the channel. A bug in a handler should not become a public disclosure.
+ */
+export const COMMAND_FAILURE_MESSAGE = 'Something went wrong running that command.';
+
+/**
+ * Sends the failure notice on whichever channel is still open.
+ *
+ * Discord allows exactly one acknowledgement per interaction, so the choice is forced: once the
+ * handler has replied or deferred, only `followUp` can work; otherwise `reply` is the one that
+ * clears the 3-second window that produces "The application did not respond".
+ */
+async function acknowledgeFailure(interaction: ChatInputCommandInteraction): Promise<void> {
+  const content = { content: COMMAND_FAILURE_MESSAGE, ephemeral: true };
+
+  if (interaction.replied || interaction.deferred) {
+    await interaction.followUp(content);
+    return;
+  }
+  await interaction.reply(content);
+}
+
+/**
+ * The listener signature `interactionCreate` actually emits: `(interaction: Interaction) => void`.
+ *
+ * Deliberately NOT `FeatureHandler`. That type erases every event tuple into one union, so it
+ * includes listeners like `(message: string) => void`; a function that insists on an `Interaction`
+ * cannot be assignable to it, and returning it would force a cast that throws the type safety away
+ * at exactly the boundary this fix exists to make safe.
+ */
+export type InteractionRouter = (...args: ClientEvents['interactionCreate']) => void;
+
+/**
+ * Builds the `interactionCreate` listener that routes chat-input commands to their handler.
+ *
+ * This is the bridge between the RUNTIME manifest and Discord. Without it a command can be
+ * deployed, appear in the picker, and then do nothing at all — which Discord reports to the user
+ * as "The application did not respond", with no clue on the bot side why.
+ *
+ * Three deliberate choices:
+ *   - Anything that is not a chat-input command is returned untouched, so buttons, selects,
+ *     autocomplete and modals stay available for features that bind their own listeners.
+ *   - An unknown command name is logged, not thrown. By the time an interaction arrives, the
+ *     deploy gate has already proved the two discovery paths agree, so a miss here means a
+ *     command was deployed out of band; crashing the whole process over it helps nobody.
+ *   - A throwing handler is answered, not propagated. Letting the rejection escape would restore
+ *     the exact symptom this function exists to remove.
+ *
+ * On success the router replies to nothing: acknowledging the interaction is the handler's job,
+ * and replying here as well would be a second acknowledgement, which discord.js rejects.
+ */
+export function createInteractionRouter(plan: RegistryPlan, log: Logger): InteractionRouter {
+  return async (interaction: Interaction): Promise<void> => {
+    if (!interaction.isChatInputCommand()) {
+      return;
+    }
+
+    const command = plan.commands.get(interaction.commandName);
+    if (command === undefined) {
+      log.warn(
+        { command: interaction.commandName },
+        'chat-input command is not in the registry: deployed commands and loaded features disagree',
+      );
+      return;
+    }
+
+    try {
+      await command.execute(interaction);
+    } catch (error) {
+      log.error({ err: error, command: interaction.commandName }, 'command handler failed');
+      await acknowledgeFailure(interaction);
+    }
+  };
+}
+
+/**
+ * Attaches every planned listener to a client, including the command router.
+ *
+ * The router is bound here rather than at the call site so that "wiring a plan onto a client"
+ * stays a single operation. A half-wired client — commands deployed but never routed — is the
+ * exact failure this module exists to prevent, so it should not be expressible.
+ *
+ * A `log` is required for that reason: the router has no way to report a bad handler without one.
+ */
+export function applyRegistry(client: Client, plan: RegistryPlan, log: Logger): void {
   for (const binding of plan.bindings) {
     client.on(binding.event, binding.handler);
   }
+  client.on('interactionCreate', createInteractionRouter(plan, log));
 }
 
 /* -------------------------------------------------------------------------------------------- */

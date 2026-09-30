@@ -262,7 +262,7 @@ src/
   config/env.ts                pure validation; no process.env at import time
   core/logger.ts               pino root + child logger, redacts credentials
   core/permissions.ts          permission set and invite-URL builder (no client needed)
-  core/registry.ts             feature discovery, wiring plan, command collection
+  core/registry.ts             feature discovery, wiring plan, command routing and collection
   client/bot.ts                client construction, intents, diagnostics, shutdown
   scripts/deploy-commands.ts   slash command deployment
   scripts/print-invite.ts      install-link generator
