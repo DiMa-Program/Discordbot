@@ -28,6 +28,16 @@
 
 import 'dotenv/config';
 
+/**
+ * Valid `affinity` (region) values, verified against the live API.
+ *
+ * These are NOT the same strings people see in the VALORANT client. `LAS` and `LA` both return
+ * error code 6 "Invalid region"; Latin America South is queried as `latam`. Riot's `na` shard also
+ * resolves LATAM and BR accounts, so several of these return the same data for one account.
+ */
+const VALID_AFFINITIES = ['na', 'latam', 'br', 'eu', 'ap', 'kr'] as const;
+const DEFAULT_AFFINITY = 'eu';
+
 const API_BASE = 'https://api.henrikdev.xyz';
 const DEFAULT_PLATFORM = 'pc';
 
@@ -68,7 +78,7 @@ function explainFailure(status: number, body: string): string {
     return 'The API key was rejected. Check HENRIK_DEV_API_KEY in your .env (or regenerate it in the dashboard).';
   }
   if (status === 404) {
-    return 'Account not found for that Riot ID and region. Riot IDs are region-bound: a player tagged EU1 usually has to be queried with region "eu".';
+    return `Account not found for that Riot ID in that region.\n  Known regions: ${VALID_AFFINITIES.join(', ')}.\n  Riot IDs are region-bound, and the region string is not the one shown in the game client: "LAS" is invalid, Latin America South is "latam".`;
   }
   if (status === 429) {
     return 'Rate limited. The free tier allows a limited number of requests per minute; wait and retry.';
@@ -84,9 +94,17 @@ async function main(): Promise<void> {
     return;
   }
 
-  const [riotIdArgument, region = 'eu', platform = DEFAULT_PLATFORM] = process.argv.slice(2);
+  const [riotIdArgument, region = DEFAULT_AFFINITY, platform = DEFAULT_PLATFORM] = process.argv.slice(2);
   if (riotIdArgument === undefined) {
     console.error('Usage: npx tsx src/scripts/probe-rank.ts "RiotName#TAG" [region] [platform]');
+    console.error(`Regions: ${VALID_AFFINITIES.join(', ')}   Platforms: pc, console`);
+    process.exitCode = 1;
+    return;
+  }
+
+  if (!(VALID_AFFINITIES as readonly string[]).includes(region)) {
+    console.error(`"${region}" is not a known region. Valid values: ${VALID_AFFINITIES.join(', ')}`);
+    console.error('Note: Latin America South is "latam". "LAS" and "LA" are rejected by the API.');
     process.exitCode = 1;
     return;
   }
