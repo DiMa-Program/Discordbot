@@ -165,6 +165,21 @@ try {
     `PuttyProtocol=putty-sftp`,
     `LocalDirectory=${stagingDir}`,
     `RemoteDirectory=${remoteDir}`,
+    // WHY THE HOST KEY IS PINNED
+    //
+    // WinSCP's CLI cannot answer the interactive "do you trust this server?" prompt. Without a stored
+    // key it aborts with "the server key has not been verified" before it ever sends a credential,
+    // which is why the same credentials worked in the WinSCP GUI (where the prompt was answered once)
+    // and failed here.
+    //
+    // SshHostKeyConfirm=0 alone would silence that, but it would also accept whatever key the host
+    // presents, which is exactly the attack the prompt exists to stop. Pinning the fingerprint means a
+    // substituted host fails loudly instead of receiving the SFTP password.
+    //
+    // Override with HEAVEN_SFTP_HOST_KEY when the provider changes machines. An empty value falls back
+    // to accepting any key, which is only reasonable on a trusted network.
+    `SshHostKey=${process.env['HEAVEN_SFTP_HOST_KEY'] ?? ''}`,
+    `SshHostKeyConfirm=0`,
     // Do not let a failed transfer look like a successful one.
     `ConfirmBeforeClose=0`,
     `PingType=1`,
