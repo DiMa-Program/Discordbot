@@ -216,13 +216,15 @@ try {
   //
   // The local side is absolute rather than relative to the process working directory, so the transfer
   // cannot silently pick up the project root instead of the staging checkout.
-  // Backslashes, not forward slashes. A forward-slash form was tried and WinSCP resolved it to
-  // `C:\.env.example`, having split the path on the first separator.
+  // The `|.git` exclusion matters. A `git worktree` checkout carries `.git` as a FILE containing
+  // `gitdir: <local path>`, so uploading it puts a pointer to this machine on the host. It is also the
+  // one file that could make the container's `if [[ -d .git ]] && git pull` guard fire against a
+  // directory that is not a repository.
   const localSpec = `${stagingDir}\\*`;
 
   const script = [
     `open ${uploadUrl} -hostkey="${hostKey}"`,
-    `put -filemask="*;*/" "${localSpec}" ${remoteDir}/`,
+    `put -filemask="*;*/|.git" "${localSpec}" ${remoteDir}/`,
     `exit`,
   ].join('\r\n');
 
