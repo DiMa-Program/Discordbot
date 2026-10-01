@@ -12,7 +12,14 @@ import type { LogLevel } from '../config/env.js';
 
 export type { Logger };
 
-/** Paths pino censors. Covers both a bare `token` and the REST client's own option bag. */
+/**
+ * Paths pino censors. Covers both a bare `token` and the REST client's own option bag.
+ *
+ * The third-party provider key is listed by name as well as by shape. Nothing in the ranks feature
+ * logs it, but `EnvConfig` now carries it, so a `log.info({ config })` anywhere in the project
+ * would otherwise publish it in cleartext. Censoring the known field names means a future logging
+ * mistake cannot become a credential leak.
+ */
 export const REDACTED_PATHS: readonly string[] = [
   'token',
   '*.token',
@@ -21,6 +28,12 @@ export const REDACTED_PATHS: readonly string[] = [
   'authorization',
   '*.authorization',
   'client.options.token',
+  'apiKey',
+  '*.apiKey',
+  'henrikDevApiKey',
+  '*.henrikDevApiKey',
+  'HENRIK_DEV_API_KEY',
+  '*.HENRIK_DEV_API_KEY',
 ];
 
 function loggerOptions(level: LogLevel): Record<string, unknown> {

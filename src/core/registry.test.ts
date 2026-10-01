@@ -356,7 +356,7 @@ describe('filesystem discovery', () => {
   });
 
   it('finds the shipped feature folders', async () => {
-    expect(await listFeatureDirectories(featuresDir)).toEqual(['ping', 'welcome']);
+    expect(await listFeatureDirectories(featuresDir)).toEqual(['ping', 'ranks', 'welcome']);
   });
 
   it('returns an empty list for a directory that does not exist', async () => {
@@ -381,9 +381,9 @@ describe('filesystem discovery', () => {
 describe('the shipped feature tree', () => {
   const featuresDir = resolveFeaturesDir();
 
-  it('loads both features', async () => {
+  it('loads every feature', async () => {
     const features = await loadFeatures(featuresDir);
-    expect(features.map((feature) => feature.name)).toEqual(['ping', 'welcome']);
+    expect(features.map((feature) => feature.name)).toEqual(['ping', 'ranks', 'welcome']);
   });
 
   it('discovers every command declared in a feature manifest', async () => {
@@ -391,20 +391,38 @@ describe('the shipped feature tree', () => {
     const plan = createRegistry(features, NO_INTENTS);
     const discovered = await collectSlashCommands(featuresDir);
 
-    expect([...plan.commands.keys()].sort()).toEqual(['config-greeting', 'ping']);
+    expect([...plan.commands.keys()].sort()).toEqual(['config-greeting', 'menu', 'ping']);
     expect(discovered.map((entry) => entry.command.data.name).sort()).toEqual([
       'config-greeting',
+      'menu',
       'ping',
     ]);
   });
 
-  it('plans the guildMemberAdd binding for the welcome feature', async () => {
+  it('plans the welcome event binding and the ranks component listener', async () => {
     const features = await loadFeatures(featuresDir);
     const plan = createRegistry(features, NO_INTENTS);
 
-    expect(plan.bindings).toEqual([
-      expect.objectContaining({ event: 'guildMemberAdd', feature: 'welcome' }),
-    ]);
+    // The ranks feature binds its own interactionCreate. The router binds another one on top, which
+    // is two listeners by design: they are disjoint, and features/ranks/ranks.test.ts proves it.
+    expect(plan.bindings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ event: 'guildMemberAdd', feature: 'welcome' }),
+        expect.objectContaining({ event: 'interactionCreate', feature: 'ranks' }),
+      ]),
+    );
+    expect(plan.bindings).toHaveLength(2);
+  });
+
+  it('keeps the router and the ranks listener as two separate listeners', async () => {
+    const features = await loadFeatures(featuresDir);
+    const plan = createRegistry(features, NO_INTENTS);
+    const on = vi.fn();
+
+    applyRegistry({ on } as unknown as Client, plan, makeLog().log);
+
+    const interactionListeners = on.mock.calls.filter((call) => call[0] === 'interactionCreate');
+    expect(interactionListeners).toHaveLength(2);
   });
 
   it('flags the privileged intent as missing when it is not enabled', async () => {

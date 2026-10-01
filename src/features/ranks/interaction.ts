@@ -1,0 +1,508 @@
+/**
+ * The ranks feature's own `interactionCreate` listener, and the `/menu` command handler.
+ *
+ * WHY THIS LISTENER EXISTS ALONGSIDE THE CORE ROUTER.
+ *
+ * `applyRegistry` binds two kinds of listener: the command router from `core/registry.ts`, and every
+ * handler a feature declares. The router answers chat-input commands and returns early for
+ * everything else; this listener answers buttons and modal submissions and returns early for
+ * chat-input. They are disjoint by construction — but this is the same shape of bug that once
+ * shipped a command which was deployed and did nothing, so the disjointness is proven against the
+ * real registry in `ranks.test.ts` rather than assumed here.
+ *
+ * THE FIRST STATEMENT IS A GUARD, NOT A PREFERENCE. `isChatInputCommand()` is evaluated before any
+ * work, because a permission check or a guild check placed above it would run twice for every slash
+ * command: once here, once in the real handler.
+ *
+ * EVERY FAILURE IS ANSWERED; NO FAILURE IS SWALLOWED. Each path replies on whichever of `reply` /
+ * `editReply` is still legal, because an interaction that is never acknowledged reaches the user as
+ * "The application did not respond" with no log line to debug it from. The one path that stays
+ * quiet is an unrecognised custom id: answering that would fight a future version of this feature
+ * for the same message.
+ */
+
+import {
+  ActionRowBuilder,
+  EmbedBuilder,
+  MessageFlags,
+  ModalBuilder,
+  PermissionFlagsBits,
+  TextInputBuilder,
+  TextInputStyle,
+} from 'discord.js';
+import type {
+  ButtonInteraction,
+  ChatInputCommandInteraction,
+  Guild,
+  Interaction,
+  ModalSubmitInteraction,
+} from 'discord.js';
+
+import type { Logger } from '../../core/logger.js';
+import { getRankProvider, isRankProviderConfigured } from './context.js';
+import { describeRankFailure, formatRankFailure, NOT_CONFIGURED_MESSAGE } from './messages.js';
+import { parseRiotId, type RiotId } from './provider.js';
+import type { RankSnapshot } from './provider.js';
+import {
+  applyRoleAssignment,
+  createGuildRoleGateway,
+  ensureRankRoles,
+  planRoleAssignment,
+  planRoleRemoval,
+  type RankRoleGateway,
+  type RoleSyncBlocker,
+} from './role-sync.js';
+import { getLinkedAccount, linkAccount, unlinkAccount } from './store.js';
+import { RANKS } from './tiers.js';
+import { buildMenuView, LINK_MODAL_ID, MENU_BUTTONS, RIOT_ID_FIELD, type MenuViewState } from './view.js';
+
+/* -------------------------------------------------------------------------------------------- */
+/* Command                                                                                        */
+/* -------------------------------------------------------------------------------------------- */
+
+/**
+ * `/menu` — the single entry point, with no arguments by design.
+ *
+ * A command that takes arguments is a command that can be typed wrong, and this one exists so
+ * nobody ever has to.
+ */
+export async function executeMenuCommand(
+  interaction: ChatInputCommandInteraction,
+  log: Logger,
+): Promise<void> {
+  if (!interaction.inGuild()) {
+    await interaction.reply({ content: 'This menu only works inside a server.', ephemeral: true });
+    return;
+  }
+  if (!isRankProviderConfigured()) {
+    // The menu itself is ephemeral, so the operator would never see this. The log is the only
+    // place that says the feature is switched off, which is exactly what has to be debuggable.
+    log.warn('HENRIK_DEV_API_KEY is not set: /menu will explain setup instead of looking up ranks');
+    await interaction.reply({ ...buildMenuView({ kind: 'not-configured' }) });
+    return;
+  }
+
+  const account = getLinkedAccount(interaction.user.id);
+  const state: MenuViewState = account === null ? { kind: 'unlinked' } : { kind: 'linked', account, snapshot: null };
+  await interaction.reply({ ...buildMenuView(state) });
+}
+
+/* -------------------------------------------------------------------------------------------- */
+/* Buttons and modals                                                                             */
+/* -------------------------------------------------------------------------------------------- */
+
+/** Interactions this feature owns, and the ones it can answer on. */
+type RankComponentInteraction = ButtonInteraction | ModalSubmitInteraction;
+
+/**
+ * Buttons and modals. Everything else — chat input above all, which the core router owns — returns
+ * immediately.
+ */
+export async function handleRankInteraction(interaction: Interaction, log: Logger): Promise<void> {
+  if (interaction.isChatInputCommand()) {
+    return;
+  }
+
+  if (interaction.isButton()) {
+    await guarded(interaction, log, (button) => handleButton(button, log));
+    return;
+  }
+  if (interaction.isModalSubmit()) {
+    await guarded(interaction, log, (modal) => handleModalSubmit(modal, log));
+  }
+}
+
+/**
+ * Runs a handler and turns anything it throws into a reply.
+ *
+ * A throwing handler that escapes would leave the interaction unacknowledged, which the user sees
+ * as "The application did not respond" and the operator sees as nothing at all.
+ */
+async function guarded<T extends RankComponentInteraction>(
+  interaction: T,
+  log: Logger,
+  run: (interaction: T) => Promise<void>,
+): Promise<void> {
+  try {
+    await run(interaction);
+  } catch (error) {
+    await answerUnexpected(interaction, error, log);
+  }
+}
+
+async function handleButton(interaction: ButtonInteraction, log: Logger): Promise<void> {
+  switch (interaction.customId) {
+    case MENU_BUTTONS.link:
+      await interaction.showModal(buildLinkModal());
+      return;
+    case MENU_BUTTONS.refresh:
+      await handleRefresh(interaction, log);
+      return;
+    case MENU_BUTTONS.unlink:
+      await handleUnlink(interaction, log);
+      return;
+    case MENU_BUTTONS.createRoles:
+      await handleCreateRoles(interaction, log);
+      return;
+    default:
+      log.warn({ customId: interaction.customId }, 'ignored a button that is not part of the ranks menu');
+  }
+}
+
+function buildLinkModal() {
+  return new ModalBuilder()
+    .setCustomId(LINK_MODAL_ID)
+    .setTitle('Link your VALORANT account')
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId(RIOT_ID_FIELD)
+          .setLabel('Riot ID')
+          .setPlaceholder('SomePlayer#EU1')
+          .setStyle(TextInputStyle.Short)
+          // The ONLY input in the modal: Discord accepts no other component type inside one, which
+          // is why the region is inferred from the tag instead of asked for.
+          .setRequired(true)
+          .setMinLength(5)
+          .setMaxLength(40),
+      ),
+    )
+    .toJSON();
+}
+
+async function handleRefresh(interaction: ButtonInteraction, log: Logger): Promise<void> {
+  const account = getLinkedAccount(interaction.user.id);
+  if (account === null) {
+    await interaction.reply({ content: NOT_LINKED_MESSAGE, ephemeral: true });
+    return;
+  }
+  const guild = guildOf(interaction);
+  if (guild === null) {
+    await interaction.reply({ content: SERVER_ONLY_MESSAGE, ephemeral: true });
+    return;
+  }
+
+  // Deferred before the first network call: the free tier is slow enough that an unacknowledged
+  // interaction would show "The application did not respond".
+  await interaction.deferUpdate();
+  const snapshot = await lookupRank(interaction, `${account.name}#${account.tag}`, log);
+  if (snapshot === null) {
+    return;
+  }
+
+  const note = await applyRankRole(guild, interaction.user.id, snapshot, log);
+  await interaction.editReply({ ...buildMenuView({ kind: 'linked', account, snapshot }), ...note });
+}
+
+async function handleUnlink(interaction: ButtonInteraction, log: Logger): Promise<void> {
+  const wasLinked = unlinkAccount(interaction.user.id);
+  const guild = guildOf(interaction);
+  const roleOutcome = guild === null ? 'No role needed removing.' : await clearRankRoles(interaction, guild, log);
+
+  await interaction.reply({
+    content: wasLinked
+      ? `Unlinked. Your Riot ID has been deleted from this bot's memory. ${roleOutcome}`
+      : 'Nothing was linked for you, so there was nothing to unlink.',
+    ephemeral: true,
+  });
+}
+
+async function handleCreateRoles(interaction: ButtonInteraction, log: Logger): Promise<void> {
+  const guild = guildOf(interaction);
+  if (guild === null) {
+    await interaction.reply({ content: SERVER_ONLY_MESSAGE, ephemeral: true });
+    return;
+  }
+  if (!canManageServer(interaction.memberPermissions)) {
+    // Checked at runtime, not only through `default_member_permissions`: that field does not exist
+    // for a button, and a cached permission list can be out of date either way.
+    await interaction.reply({ content: MANAGE_SERVER_REQUIRED, ephemeral: true });
+    return;
+  }
+
+  // Up to 26 REST calls, so the acknowledgement happens before the first one.
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const result = await ensureRankRoles(createGuildRoleGateway(guild));
+
+  if (result.blockedBy !== null) {
+    await interaction.editReply({ content: describeBlocker(result.blockedBy) });
+    return;
+  }
+
+  log.info({ created: result.created.length, reused: result.skipped.length }, 'rank roles reconciled');
+  await interaction.editReply({ embeds: [buildRolesEmbed(result.created.length, result.skipped.length)] });
+}
+
+async function handleModalSubmit(interaction: ModalSubmitInteraction, log: Logger): Promise<void> {
+  if (interaction.customId !== LINK_MODAL_ID) {
+    log.warn({ customId: interaction.customId }, 'ignored a modal submit that is not the link modal');
+    return;
+  }
+  const guild = guildOf(interaction);
+  if (guild === null) {
+    await interaction.reply({ content: SERVER_ONLY_MESSAGE, ephemeral: true });
+    return;
+  }
+
+  // Deferring before the key check as well: a modal submit that is not acknowledged within three
+  // seconds is dismissed with no explanation.
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  if (!isRankProviderConfigured()) {
+    await interaction.editReply({ content: NOT_CONFIGURED_MESSAGE.detail });
+    return;
+  }
+
+  // A malformed ID is rejected before any request is spent, and answered as the ordinary user
+  // error it is: an ERROR log line for a typo is noise that trains operators to ignore the log.
+  const raw = interaction.fields.getTextInputValue(RIOT_ID_FIELD);
+  let riotId: RiotId;
+  try {
+    riotId = parseRiotId(raw);
+  } catch (error) {
+    log.debug({ requestId: `rank-${interaction.id}` }, 'rejected a malformed Riot ID from the link modal');
+    await interaction.editReply({
+      content: formatRankFailure(describeRankFailure(error), `rank-${interaction.id}`),
+    });
+    return;
+  }
+
+  const snapshot = await lookupRank(interaction, `${riotId.name}#${riotId.tag}`, log);
+  if (snapshot === null) {
+    return;
+  }
+
+  // Stored only after the lookup succeeded: consent is captured by this flow, and a Riot ID that
+  // could not be verified is not worth remembering.
+  const account = linkAccount(interaction.user.id, { name: riotId.name, tag: riotId.tag });
+  const note = await applyRankRole(guild, interaction.user.id, snapshot, log);
+  await interaction.editReply({ ...buildMenuView({ kind: 'linked', account, snapshot }), ...note });
+}
+
+/* -------------------------------------------------------------------------------------------- */
+/* Shared steps                                                                                   */
+/* -------------------------------------------------------------------------------------------- */
+
+/**
+ * Performs the lookup, answering the interaction with a mapped failure and returning `null` when it
+ * did not succeed.
+ *
+ * Returns `null` instead of throwing so the callers read as "the only difference between success
+ * and failure is that we already answered". The raw error goes to the log with a request id; the
+ * channel gets text that was built for a human to read.
+ */
+async function lookupRank(
+  interaction: RankComponentInteraction,
+  riotId: string,
+  log: Logger,
+): Promise<RankSnapshot | null> {
+  const requestId = `rank-${interaction.id}`;
+  try {
+    return await getRankProvider().fetchRank({ riotId });
+  } catch (error) {
+    log.error({ err: error, requestId, riotId }, 'rank lookup failed');
+    await editOrFollowUp(interaction, formatRankFailure(describeRankFailure(error), requestId));
+    return null;
+  }
+}
+
+/** Extra fields to merge into a rank embed when the role could not be applied. */
+interface RoleChangeNote {
+  readonly content?: string;
+}
+
+/**
+ * Applies the rank role and returns a note when something got in the way.
+ *
+ * Silent on the clean path, because "your role was applied" on every successful refresh is noise,
+ * and "I could not do this" is not.
+ */
+async function applyRankRole(
+  guild: Guild,
+  userId: string,
+  snapshot: RankSnapshot,
+  log: Logger,
+): Promise<RoleChangeNote> {
+  const gateway = createGuildRoleGateway(guild);
+  const held = await readMemberRoleIds(gateway, userId, log);
+  if (held === null) {
+    // The plan cannot be built without knowing what the member already holds: granting blind would
+    // leave two rank roles on them, and Discord would render the higher one — the exact silent
+    // wrong-rank this feature exists to avoid.
+    return { content: COULD_NOT_READ_ROLES };
+  }
+
+  const plan = planRoleAssignment({
+    tiers: RANKS,
+    guildRoles: await gateway.listRankRoles(),
+    memberRoleIds: held,
+    tier: snapshot.tier,
+    canManageRoles: gateway.canManageRoles,
+    botTopPosition: gateway.botTopPosition,
+  });
+
+  const result = await applyRoleAssignment(gateway, plan, userId);
+  if (result.blockedBy !== null) {
+    log.warn({ blockedBy: result.blockedBy, userId }, 'rank role sync refused');
+    return { content: describeBlocker(result.blockedBy) };
+  }
+  if (result.assignedRoleId === null) {
+    return { content: NO_ROLE_FOR_RANK };
+  }
+  return {};
+}
+
+/** Removes every rank role the member holds. Used by the unlink path. */
+async function clearRankRoles(interaction: ButtonInteraction, guild: Guild, log: Logger): Promise<string> {
+  const gateway = createGuildRoleGateway(guild);
+  const held = await readMemberRoleIds(gateway, interaction.user.id, log);
+  if (held === null) {
+    return COULD_NOT_READ_ROLES;
+  }
+
+  const plan = planRoleRemoval({
+    tiers: RANKS,
+    guildRoles: await gateway.listRankRoles(),
+    memberRoleIds: held,
+    canManageRoles: gateway.canManageRoles,
+  });
+
+  if (plan.blockedBy !== null) {
+    return describeBlocker(plan.blockedBy);
+  }
+  const result = await applyRoleAssignment(gateway, plan, interaction.user.id);
+  return result.removedRoleIds.length === 0 ? 'No rank role needed removing.' : 'Your rank role was removed.';
+}
+
+/**
+ * The member's current roles, or `null` when they could not be read.
+ *
+ * `null` is a refusal, not an empty list. A member who left the server, or a cache miss on a role
+ * read, must not be treated as holding nothing: doing so would make the sync grant the new role
+ * without removing the old one.
+ */
+async function readMemberRoleIds(
+  gateway: RankRoleGateway,
+  userId: string,
+  log: Logger,
+): Promise<readonly string[] | null> {
+  try {
+    return await gateway.getMemberRoleIds(userId);
+  } catch (error) {
+    log.warn({ err: error, userId }, 'could not read the member roles; skipping the rank role change');
+    return null;
+  }
+}
+
+/* -------------------------------------------------------------------------------------------- */
+/* Messages                                                                                       */
+/* -------------------------------------------------------------------------------------------- */
+
+const SERVER_ONLY_MESSAGE = 'Rank roles only exist inside a server.';
+
+const MANAGE_SERVER_REQUIRED =
+  'You need the Manage Server permission to create the rank roles. Ask a server admin to run it.';
+
+const NOT_LINKED_MESSAGE = 'You have not linked a Riot ID yet. Run `/menu` and press **Link account** first.';
+
+const NO_ROLE_FOR_RANK =
+  'Your rank is shown above, but this server has no role for it yet. Someone with **Manage Server** can press **Create rank roles** in `/menu`.';
+
+const COULD_NOT_READ_ROLES =
+  'Your rank is shown above, but no role was applied: the bot could not read your current roles. Try again in a moment.';
+
+/**
+ * The message for each way a role change can be refused.
+ *
+ * Every one of these is a configuration fact the reader can act on, which is the whole point: a
+ * raw Discord 403 says "Missing Permissions" and nothing about which permission, on which object,
+ * or in which direction the hierarchy is wrong.
+ */
+export function describeBlocker(blocker: RoleSyncBlocker): string {
+  switch (blocker) {
+    case 'missing-permission':
+      return (
+        'The bot cannot manage roles in this server, so no role was applied. Someone who runs ' +
+        'the bot has to grant it **Manage Roles** (Server Settings → Roles → the bot → ' +
+        'Permissions). You can re-run this from `/menu` afterwards.'
+      );
+    case 'role-hierarchy':
+      return (
+        'The rank role sits above the bot’s own role, so Discord will not let the bot assign it. ' +
+        'Move the bot’s role higher in Server Settings → Roles, then re-run this from `/menu`. ' +
+        'Your rank is unchanged.'
+      );
+    case 'role-not-created':
+      return NO_ROLE_FOR_RANK;
+  }
+}
+
+function canManageServer(permissions: { has(bit: bigint): boolean } | null): boolean {
+  return permissions?.has(PermissionFlagsBits.ManageGuild) === true;
+}
+
+/**
+ * The guild, or `null` in a direct message.
+ *
+ * `inGuild()` does not narrow the `guild` property for TypeScript, and a non-null assertion here
+ * would be a lie the compiler cannot check — so the null travels with the value and every caller
+ * decides what to say about it.
+ */
+function guildOf(interaction: RankComponentInteraction): Guild | null {
+  return interaction.inGuild() ? interaction.guild : null;
+}
+
+function buildRolesEmbed(created: number, reused: number) {
+  const embed = new EmbedBuilder()
+    .setColor(0x6ae2af)
+    .setTitle('Rank roles')
+    .setDescription(
+      created === 0
+        ? 'Every rank role already existed. Nothing was changed.'
+        : `Created ${created} role${created === 1 ? '' : 's'}. ${reused} already existed and were left untouched.`,
+    )
+    .setFooter({
+      text: 'Members pick their rank with /menu. Role icons need Server Boost level 2, so plain colours are used.',
+    });
+  return embed;
+}
+
+/* -------------------------------------------------------------------------------------------- */
+/* Failure acknowledgement                                                                        */
+/* -------------------------------------------------------------------------------------------- */
+
+/**
+ * Answers on whichever channel is still open.
+ *
+ * Forced by Discord's one-acknowledgement rule: a path that deferred must `editReply`, a path that
+ * has replied nothing must `reply`, and a path that has already replied must `followUp`. Getting
+ * this wrong is what produces a silent "The application did not respond".
+ */
+async function answerUnexpected(interaction: RankComponentInteraction, error: unknown, log: Logger): Promise<void> {
+  const requestId = `rank-${interaction.id}`;
+  log.error({ err: error, requestId }, 'ranks interaction failed unexpectedly');
+  const content = formatRankFailure(describeRankFailure(error), requestId);
+
+  if (interaction.deferred && !interaction.replied) {
+    await interaction.editReply({ content });
+    return;
+  }
+  if (interaction.replied) {
+    await interaction.followUp({ content, flags: MessageFlags.Ephemeral });
+    return;
+  }
+  await interaction.reply({ content, flags: MessageFlags.Ephemeral });
+}
+
+/** Reaches the response channel of a component interaction regardless of how far it got. */
+async function editOrFollowUp(interaction: RankComponentInteraction, content: string): Promise<void> {
+  if (interaction.deferred && !interaction.replied) {
+    await interaction.editReply({ content });
+    return;
+  }
+  if (interaction.replied) {
+    await interaction.followUp({ content, flags: MessageFlags.Ephemeral });
+    return;
+  }
+  await interaction.reply({ content, flags: MessageFlags.Ephemeral });
+}

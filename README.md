@@ -4,8 +4,8 @@ An extensible discord.js bot that installs into any server through OAuth2 using 
 least-privilege permission set, and grows by dropping a folder into `src/features/` — without
 editing a single core file.
 
-- **Least privilege by construction.** The install link requests only `SendMessages` and
-  `EmbedLinks`. `Administrator` and `Manage Server` are hard errors, not warnings.
+- **Least privilege by construction.** The install link requests only `SendMessages`, `EmbedLinks`
+  and `ManageRoles`. `Administrator` and `Manage Server` are hard errors, not warnings.
 - **Intents are explicit.** The bot runs with no Developer Portal changes. Privileged intents
   stay off until you ask for them, and only the ones a feature actually needs are requested.
 - **Deploy-safe.** Command deployment refuses to publish if a command exists on disk but was
@@ -66,9 +66,15 @@ The bot reads secrets from the environment, loading `.env` at startup. `.env` is
 | `DISCORD_DEV_GUILD_ID` | no | *(unset)* | When set, commands deploy to that one server. When unset, they deploy **globally**. |
 | `LOG_LEVEL` | no | `info` | One of `trace`, `debug`, `info`, `warn`, `error`, `fatal`, `silent`. |
 | `ENABLE_PRIVILEGED_INTENTS` | no | `false` | Opt in to the privileged intents features declare. See below. |
+| `HENRIK_DEV_API_KEY` | no | *(unset)* | Key for the VALORANT rank provider. Unset means the ranks feature is inert: `/menu` still works and explains what is missing. Get one at [henrikdev.xyz](https://henrikdev.xyz/account). |
 
 If `ENABLE_PRIVILEGED_INTENTS` is not already in your `.env`, add it with the value `false`.
 It is optional and that is the default.
+
+`HENRIK_DEV_API_KEY` has one sharp edge: **delete the line entirely to turn the feature off.** A
+blank value (`HENRIK_DEV_API_KEY=`) is reported as a configuration error, not treated as "no key",
+because a copy/paste that lost the value would otherwise surface much later as a rank lookup that
+silently never works.
 
 Misconfiguration is reported in one pass, with the fix for each variable:
 
@@ -123,11 +129,12 @@ npm run invite
 ```
 Install this bot into a server by opening this URL:
 
-  https://discord.com/oauth2/authorize?client_id=123456789012345678&scope=bot+applications.commands&permissions=18432
+  https://discord.com/oauth2/authorize?client_id=123456789012345678&scope=bot+applications.commands&permissions=268453888
 
 Requested channel permissions:
   - SendMessages — Reply to slash commands and post the opt-in welcome greeting.
   - EmbedLinks — Render command replies as rich embeds instead of plain text.
+  - ManageRoles — Create the VALORANT rank roles and keep the correct one assigned to each member.
 
 Deliberately not requested: Administrator, ManageGuild.
 ```
@@ -136,14 +143,90 @@ The script needs only `DISCORD_CLIENT_ID` — not the bot token — so you can p
 before the bot has ever run. Open the URL, choose a server, and approve. The consent screen
 lists exactly the permissions above, so the server owner can see the scope before approving.
 
-`permissions=18432` is `SendMessages` (2048) `| EmbedLinks` (16384). `applications.commands` in
-the scope list is what makes slash commands appear; without it the bot installs and no command
-ever shows up.
+`permissions=268453888` is `SendMessages` (2048) `| EmbedLinks` (16384) `| ManageRoles`
+(268435456). `applications.commands` in the scope list is what makes slash commands appear;
+without it the bot installs and no command ever shows up.
 
 **Managing permissions without reinstalling.** `/config-greeting` requires *Manage Server* from
 the caller, but the bot is never installed with that permission. It is checked at runtime and
 also declared as the command's `default_member_permissions`, so Discord hides the command from
 members who cannot use it.
+
+`ManageRoles` is different: it **is** requested at install time, because a server owner has to
+approve it or the bot can never create the rank roles it exists to manage. You do not have to
+reinstall to add it. Open **Server Settings → Roles**, click the bot's role, tick
+**Manage Roles**, save. The feature reads the permission from the live guild on every use, so it
+starts working on the next `/menu` without a restart. Removing it likewise takes effect
+immediately, and the feature then says so instead of failing.
+
+## VALORANT rank roles
+
+`/menu` links a member's Riot ID, reads their competitive rank and keeps exactly one rank role on
+them. It takes no arguments: everything happens through buttons and one text field.
+
+### Quick path
+
+1. Add `HENRIK_DEV_API_KEY` to `.env` and restart. Without it the feature is inert and `/menu`
+   explains why.
+2. Run `/menu` → **Create rank roles** (needs *Manage Server*). This creates all 26 roles, and is
+   safe to run twice.
+3. Run `/menu` → **Link account** → paste a Riot ID like `SomePlayer#EU1`.
+4. The rank role is applied immediately. Use **Refresh rank** to re-check.
+
+### What the user does, and what they never do
+
+| Step | Who chooses it |
+|------|----------------|
+| Riot ID (`Name#TAG`) | The member. One text field. |
+| Region | **Never asked.** Inferred from the tag, then retried across the other shards. |
+| Whether the bot reads their rank | The member, by pressing **Link account**. |
+
+That last row is the consent capture, and it is a real one: a Riot ID is written to storage only
+inside the modal submit handler, and only after a lookup succeeds. **Unlink** deletes it.
+
+A region dropdown is not an option because **Discord modals accept only text inputs** — no select
+menu can be placed inside one. Inference is allowed to be wrong: the tag picks the first shard, then
+every other affinity is tried in turn, and Riot's `na` shard also resolves LATAM and BR accounts,
+which is what rescues a South American player whose tag does not match.
+
+### Things that will look like bugs but are not
+
+| Behaviour | Why |
+|-----------|-----|
+| A promotion takes a few minutes to show | The free tier caches responses for **300 seconds**. The UI never claims the data is live. |
+| Ranks are named `Ascendant 2`, not `ASCENDANT 2` | Tiers are matched on the **normalised name**, never on Riot's tier id. Riot renumbered every id from 21 up when Ascendant arrived, so an id-based mapping silently assigns the wrong role. A test scans the source to keep it that way. |
+| Roles have plain colours, no icons | Role icons require **Server Boost level 2**. Out of our control. |
+| Links are lost on restart | Storage is an in-memory `Map`, like `welcome/greeting-store.ts`. Members relink after a deploy. |
+| Only the highest rank role is ever held | Discord renders one role's colour, not a blend. The old role is always removed in the same operation that grants the new one. |
+
+### The `ManageRoles` bit
+
+The feature needs *Manage Roles* on the bot. See
+[Managing permissions without reinstalling](#install-into-a-server) — it takes effect immediately,
+no reinstall.
+
+Two failure modes are detected before Discord can produce an opaque 403, and each gets its own
+message:
+
+- **No `Manage Roles`** — read from the live guild on every use, never assumed from the install
+  bitfield, because the permission can be revoked afterwards.
+- **Role hierarchy** — Discord will not let a bot assign a role at or above its own. If that is the
+  problem, the message says to move the bot's role higher in *Server Settings → Roles*.
+
+Both leave the member's existing role untouched, rather than stripping it and leaving them with
+nothing.
+
+### Not included
+
+- **Automatic sync on join** needs the privileged `GuildMembers` intent and does not detect
+  promotions for members who are already in the server. Deferred; the provider interface does not
+  block it.
+- **Periodic re-sync** is deferred for the same reason, plus Discord's role-change rate limits.
+- **A different rank provider** is one class with one method (`RankProvider`), constructed in a
+  single place: `src/features/ranks/context.ts`.
+
+Deleting `src/features/ranks/` removes the entire feature. The only core changes it depends on are
+the optional env key and the `ManageRoles` bit, and both revert independently.
 
 ## Add a new feature
 
@@ -269,10 +352,13 @@ src/
   features/
     ping/                      reference feature: one command
     welcome/                   reference feature: one event handler + toggle command
+    ranks/                     VALORANT rank roles: /menu, modal, buttons, provider, role sync
 ```
 
 Pure logic is separated from discord.js objects on purpose: `permissions.ts`, `registry.ts` and
-`env.ts` are all testable without a client, a token or a `.env` file.
+`env.ts` are all testable without a client, a token or a `.env` file. The ranks feature keeps the
+same split inside its folder — `tiers.ts`, `regions.ts` and `role-sync.ts` hold the rules, and only
+`interaction.ts` and the discord.js gateway adapter touch the library.
 
 ## Troubleshooting
 
@@ -288,6 +374,12 @@ Pure logic is separated from discord.js objects on purpose: `permissions.ts`, `r
 | `feature declared gateway intents that are not enabled` | Feature needs a privileged intent you have not granted | Enable the portal toggle **and** `ENABLE_PRIVILEGED_INTENTS=true`, then restart. |
 | Welcome greetings never appear | Greetings are off per guild | Run `/config-greeting enabled:true channel:#your-channel` as a member with Manage Server. |
 | `/config-greeting` not in the picker | Command is hidden from members without Manage Server | Expected. It is intentionally restricted. |
+| `/menu` says rank lookups are not set up | `HENRIK_DEV_API_KEY` is missing or blank | Add the key, or delete the line to accept that the feature is off, then restart. |
+| `/menu` says the bot cannot manage roles | The bot lacks *Manage Roles* in that server | Server Settings → Roles → the bot's role → tick **Manage Roles**. No reinstall. |
+| Rank role is not applied | The rank role sits at or above the bot's own role | Move the bot's role higher in Server Settings → Roles. |
+| "This server has no role for that rank yet" | The 26 roles were never created | Press **Create rank roles** in `/menu` as someone with Manage Server. |
+| A promotion does not show up | The free tier caches for 300 seconds | Wait five minutes, then **Refresh rank**. |
+| Everyone had to relink | Links live in memory and die with the process | Expected. Replace `ranks/store.ts` with a real store. |
 | `feature manifests and the commands/ tree disagree` | A command file is not listed in its feature `index.ts` | Add it to the `commands` array, or remove the file. |
 | `duplicate command name: the first registration wins` | Two features claim the same command name | Rename one of them. |
 | `The client needs to be logged in to generate an invite link` | Calling `client.generateInvite` directly | Use `buildInstallUrl` from `src/core/permissions.ts` instead. It needs no client. |
@@ -297,6 +389,7 @@ Pure logic is separated from discord.js objects on purpose: `permissions.ts`, `r
 
 - [ ] `.env` exists and `npm run typecheck` / `npm test` / `npm run build` all pass.
 - [ ] `npm run deploy:commands` completes without a disagreement error.
-- [ ] `npm run invite` prints a URL containing `permissions=18432` and no administrator bit.
+- [ ] `npm run invite` prints a URL containing `permissions=268453888` and no administrator bit.
 - [ ] `/ping` replies after installing.
+- [ ] `/menu` shows the menu; **Create rank roles** creates 26 roles and is safe to run twice.
 - [ ] `.env` is gitignored and was never committed.
