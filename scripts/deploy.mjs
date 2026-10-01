@@ -244,8 +244,16 @@ try {
         `open ${backupUrl} -hostkey="${hostKey}"`,
         `option batch on`,
         `option confirm off`,
-        `cd /home/container`,
-        `get -filemask="bot.db*" data/ ${backupStaging}`,
+        // No `cd` first, and an explicit `get` per file rather than a filemask against the directory.
+        //
+        // Both of those were tried and both fail on this host with `no such file`, even though the
+        // files are there: after `cd /home/container`, a `get` of the relative path `data` resolves
+        // as though the directory itself were the mask, and WinSCP rejects a directory that ends in
+        // `/` as ambiguous. A fully qualified remote path with no `cd` transfers all three files
+        // every time, which was verified against the live database.
+        `get ${remoteDir}/data/bot.db ${backupStaging}\\bot.db`,
+        `get ${remoteDir}/data/bot.db-wal ${backupStaging}\\bot.db-wal`,
+        `get ${remoteDir}/data/bot.db-shm ${backupStaging}\\bot.db-shm`,
         `exit`,
       ].join('\r\n') + '\r\n',
       { encoding: 'utf8' },
