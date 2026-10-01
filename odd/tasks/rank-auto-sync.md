@@ -74,14 +74,69 @@ OUT:
 
 ## Task list
 
-- [ ] T1 — `store.ts`: list every linked account; persist a per-user prompt decision
-- [ ] T2 — join handler with the one-time opt-in prompt
-- [ ] T3 — periodic sync with staggering, overlap protection and restart safety
-- [ ] T4 — `RANK_SYNC_INTERVAL_MINUTES` in config, default 720
-- [ ] T5 — tests for the store additions, the scheduler and the prompt decision logic
-- [ ] T6 — GitHub Actions renewal reminder
-- [ ] T7 — database backup in `npm run deploy`, before the upload, keeping a bounded history
-- [ ] T8 — README and `.env.example`
+- [x] T1 — `store.ts`: list every linked account; persist a per-user prompt decision
+- [x] T2 — join handler with the one-time opt-in prompt
+- [x] T3 — periodic sync with staggering, overlap protection and restart safety
+- [x] T4 — `RANK_SYNC_INTERVAL_MINUTES` in config, default 720
+- [x] T5 — tests for the store additions, the scheduler and the prompt decision logic
+- [x] T6 — GitHub Actions renewal reminder
+- [x] T7 — database backup in `npm run deploy`, before the upload, keeping a bounded history
+- [x] T8 — README and `.env.example`
+
+## Design decisions taken
+
+1. **Prompt decisions live in their own table**, not as a column on `valorant_links`. A declined member
+   has a decision and no link, and `unlinkAccount` deletes the whole row, so a column would either
+   vanish on unlink or re-ask someone who deliberately left. `CREATE TABLE IF NOT EXISTS` is also
+   additive where `ALTER TABLE ADD COLUMN` is not portable in SQLite.
+2. **Staggering is a derived hash, never stored state.** `accountPhase` is FNV-1a over the user id and
+   an account is due when its slot falls in the current window. Because the phase depends only on the
+   id, there is no cursor or "last synced" column for a restart to lose, which is what makes a restart
+   unable to storm the provider. Measured across a full cycle: 10 members land on 10 distinct minutes,
+   150 on 136, each selected exactly once.
+3. **One shared code path for role work.** `syncMemberRankRole` is used by both the `/menu` refresh and
+   the periodic pass. Two copies of read-plans-apply are free to disagree about which stale role to
+   remove, and disagreeing there is how a member ends up wearing two rank roles with nothing logged.
+4. **The reminder uses a single open GitHub issue as its entire state machine.** No stored cursor: the
+   job opens an issue, and the operator closes it after renewing. Daily cron only decides whether to
+   act. It cannot live on the free instance, because that is exactly what dies when the reminder
+   matters.
+5. **A backup failure warns and continues.** The deploy does not touch `data/`, so blocking it on a
+   backup would be a worse failure than the one it prevents.
+
+## Verified after implementation
+
+- `npm run typecheck` — exit 0
+- `npm test` — 13 files, **310 tests passed** (was 244 across 11)
+- `npm run build` — exit 0
+- Migration 3 verified against a copy of the **real** `data/bot.db`: schema v2 to v3, the existing
+  `valorant_links` row preserved, second `applyMigrations` returned `[]`. The original file untouched.
+
+## Known gap found during verification
+
+The database backup currently reports nothing on the host, and the reason is not in the code. SFTP
+against this provider returns:
+
+- `ls <directory>` for `data/` → error code 4, "failure"
+- `get /home/container/data/` → `no such file`
+- while `ls /home/container` lists `data` correctly
+
+The directory demonstrably exists — the running bot reports `database: /home/container/data/bot.db`
+and `ls` of the parent shows it. The `get` path fails on the trailing-slash form with an ambiguity
+warning: *"selecting files using paths ending in / is ambiguous"*. The next step is a `get` without
+the trailing slash, or a file-level `get` of the three known names. This is **not yet fixed**; the
+backup step warns and the deploy proceeds, which is why nothing broke.
+
+## Operator prerequisites
+
+1. Developer Portal → Bot → Privileged Gateway Intents → **Server Members Intent** ON. Without it
+   `guildMemberAdd` never arrives, so neither the greeting nor the prompt fires, and the sync pass
+   reports an empty member cache and skips the guild.
+2. `.env` on the host: `ENABLE_PRIVILEGED_INTENTS=true`. Optionally `RANK_SYNC_INTERVAL_MINUTES`
+   (default 720; a blank value is a startup error, not "unset").
+3. **Restart required.** No new slash commands, so `deploy:commands` does **not** need re-running.
+4. Confirm from the log alone: `automatic rank sync scheduled` with `intervalMinutes`, `intervalMs`,
+   `tickMinutes`, `concurrency` and `linkedAccounts`.
 
 ## Acceptance criteria
 
