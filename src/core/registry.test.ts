@@ -391,11 +391,15 @@ describe('the shipped feature tree', () => {
     const plan = createRegistry(features, NO_INTENTS);
     const discovered = await collectSlashCommands(featuresDir);
 
-    expect([...plan.commands.keys()].sort()).toEqual(['config-greeting', 'menu', 'ping']);
+    // Both lists, asserted separately and explicitly, because they are the two halves of the
+    // deploy gate: a command in one and not the other is a command that either never appears in
+    // Discord or appears with no handler behind it.
+    expect([...plan.commands.keys()].sort()).toEqual(['config-greeting', 'menu', 'ping', 'rank']);
     expect(discovered.map((entry) => entry.command.data.name).sort()).toEqual([
       'config-greeting',
       'menu',
       'ping',
+      'rank',
     ]);
   });
 

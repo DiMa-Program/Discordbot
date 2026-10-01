@@ -20,6 +20,20 @@ import { findTierByName, type RankTier } from './tiers.js';
 
 const API_BASE = 'https://api.henrikdev.xyz';
 
+/**
+ * How long a rank stays acceptable without asking the provider again, in milliseconds.
+ *
+ * THE UPSTREAM WINDOW, NOT AN ARBITRARY ONE. The free tier caches a response for 300 seconds, so
+ * re-reading inside that window costs a request and cannot return anything different. This is
+ * therefore the number that keeps the feature inside the provider's rate limit: the common case for
+ * a command someone runs twice is answered from memory.
+ *
+ * Equal to the window it is derived from, which is why it lives next to the endpoint rather than
+ * in the store: the store decides when a cached rank has expired, and it can only do that honestly
+ * while the window it measures against is the provider's own.
+ */
+export const RANK_CACHE_TTL_MS = 300_000;
+
 /** Provider error codes this feature reacts to. Anything else is treated as unexpected. */
 export const RANK_ERROR_CODES = {
   /** The region string we sent is invalid. Our bug; it must never reach a user. */

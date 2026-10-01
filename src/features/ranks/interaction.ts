@@ -1,5 +1,6 @@
 /**
- * The ranks feature's own `interactionCreate` listener, and the `/menu` command handler.
+ * The ranks feature's own `interactionCreate` listener, and the `/menu` and `/rank` command
+ * handlers.
  *
  * WHY THIS LISTENER EXISTS ALONGSIDE THE CORE ROUTER.
  *
@@ -52,9 +53,18 @@ import {
   type RankRoleGateway,
   type RoleSyncBlocker,
 } from './role-sync.js';
-import { getLinkedAccount, linkAccount, unlinkAccount } from './store.js';
+import { cacheRank, getCachedRank, getLinkedAccount, isRankCacheFresh, linkAccount, unlinkAccount } from './store.js';
+import type { LinkedAccount } from './store.js';
 import { RANKS } from './tiers.js';
-import { buildMenuView, LINK_MODAL_ID, MENU_BUTTONS, RIOT_ID_FIELD, type MenuViewState } from './view.js';
+import {
+  buildMenuView,
+  buildRankView,
+  LINK_MODAL_ID,
+  MENU_BUTTONS,
+  RIOT_ID_FIELD,
+  type MenuViewState,
+  type RankSubject,
+} from './view.js';
 
 /* -------------------------------------------------------------------------------------------- */
 /* Command                                                                                        */
@@ -85,6 +95,136 @@ export async function executeMenuCommand(
   const account = getLinkedAccount(interaction.user.id);
   const state: MenuViewState = account === null ? { kind: 'unlinked' } : { kind: 'linked', account, snapshot: null };
   await interaction.reply({ ...buildMenuView(state) });
+}
+
+/**
+ * `/rank` — the rank of a member who has already linked an account.
+ *
+ * NO RIOT ID OPTION, AND THAT IS A COMPLIANCE CONSTRAINT RATHER THAN A DESIGN TASTE.
+ *
+ * The provider's terms state that analytic services where the user has not given consent are not
+ * supported, and Riot's own policy forbids exposing a player's data without opt-in. Accepting a Riot
+ * ID here would let anyone look up any player, which is precisely the bypass of the consent flow
+ * the rest of this feature is built around — the link is the consent, and there is no second way in.
+ * So the command takes a Discord user and nothing else, and a member with no link is answered
+ * locally rather than looked up upstream.
+ *
+ * NO PERMISSION GATE, ON PURPOSE. Reading the rank of a member who linked is public within the
+ * guild by design: linking already agreed to it, and a gate here would hide the command from
+ * exactly the people who linked. It is a bot with no token and no history, so there is nothing to
+ * gate.
+ */
+export async function executeRankCommand(
+  interaction: ChatInputCommandInteraction,
+  log: Logger,
+): Promise<void> {
+  if (!interaction.inGuild()) {
+    await interaction.reply({ content: SERVER_ONLY_MESSAGE, flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (!isRankProviderConfigured()) {
+    // Same reasoning as `/menu`: the reply is ephemeral, so the log is the only place the operator
+    // can see that the feature is switched off. The user-facing half reuses the shared message.
+    log.warn('HENRIK_DEV_API_KEY is not set: /rank will explain setup instead of looking up ranks');
+    await interaction.reply({ content: NOT_CONFIGURED_MESSAGE.detail, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  // No argument means the caller's own rank, so the two paths share every step after this line.
+  const target = interaction.options.getUser('member') ?? interaction.user;
+  const subject: RankSubject = target.id === interaction.user.id ? 'self' : 'other';
+
+  const account = getLinkedAccount(target.id);
+  if (account === null) {
+    // Answered here, without touching the provider: a member who never linked has consented to
+    // nothing, so there is nothing to ask about and nothing to reveal.
+    await interaction.reply({
+      content: notLinkedMessage(subject, target.id),
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  const resolved = await resolveRank(interaction, target.id, account, log);
+  if (resolved === null) {
+    return;
+  }
+  const view = buildRankView({
+    subject,
+    account,
+    snapshot: resolved.snapshot,
+    fetchedAt: resolved.fetchedAt,
+    now: Date.now(),
+    fromCache: resolved.fromCache,
+  });
+
+  // Discord allows exactly one acknowledgement, so which method is legal depends on whether the
+  // lookup deferred. A cached answer never waited on the network, so it is still free to `reply`.
+  if (resolved.acknowledged) {
+    await interaction.editReply({ embeds: view.embeds });
+    return;
+  }
+  await interaction.reply({ ...view });
+}
+
+/** A rank to display, the honest label for where it came from, and how to send it. */
+interface ResolvedRank {
+  readonly snapshot: RankSnapshot;
+  readonly fetchedAt: number;
+  readonly fromCache: boolean;
+  /**
+   * True when this function already deferred the interaction.
+   *
+   * Carried rather than left implicit because the answer has two delivery paths: a rank that was
+   * already cached is answered with `reply`, and one that cost a request was answered with
+   * `editReply` because it had to be deferred first.
+   */
+  readonly acknowledged: boolean;
+}
+
+/**
+ * Serves the cached rank while it is inside the provider's window, and otherwise fetches a fresh one.
+ *
+ * THE CACHE IS THE POINT. The free tier allows 30 requests a minute and answers from a 300-second
+ * cache, so a member re-running the command — the single most common thing anyone does with a rank
+ * command — is served from memory and spends nothing. The cached answer is labelled as cached, so
+ * spending no request is visible rather than a silent claim to be live.
+ *
+ * The target may be somebody other than the caller, and a stale cache for them is refreshed the
+ * same way. That is correct rather than a leak: the refresh reads the account that member already
+ * linked, which is exactly the read they consented to, and it is not broadcast — the reply is
+ * ephemeral to the caller who asked.
+ *
+ * @returns `null` after answering a failure, so every caller reads as "the only difference between
+ *          success and failure is that we already replied".
+ */
+async function resolveRank(
+  interaction: ChatInputCommandInteraction,
+  userId: string,
+  account: LinkedAccount,
+  log: Logger,
+): Promise<ResolvedRank | null> {
+  const cached = getCachedRank(userId);
+  if (cached !== null && isRankCacheFresh(cached)) {
+    return { snapshot: cached.snapshot, fetchedAt: cached.fetchedAt, fromCache: true, acknowledged: false };
+  }
+
+  // Deferred before the first network call: the free tier is slow enough that an unacknowledged
+  // interaction would show "The application did not respond".
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  const requestId = `rank-${interaction.id}`;
+  try {
+    const snapshot = await getRankProvider().fetchRank({ riotId: `${account.name}#${account.tag}` });
+    // Written only on success, so a provider blip leaves the previous entry standing. The member
+    // loses this reply but keeps a rank the bot already knew, and the next run can serve it.
+    const stored = cacheRank(userId, snapshot);
+    return { snapshot: stored.snapshot, fetchedAt: stored.fetchedAt, fromCache: false, acknowledged: true };
+  } catch (error) {
+    log.error({ err: error, requestId, userId, riotId: `${account.name}#${account.tag}` }, 'rank lookup failed');
+    await interaction.editReply({ content: formatRankFailure(describeRankFailure(error), requestId) });
+    return null;
+  }
 }
 
 /* -------------------------------------------------------------------------------------------- */
@@ -191,6 +331,9 @@ async function handleRefresh(interaction: ButtonInteraction, log: Logger): Promi
   }
 
   const note = await applyRankRole(guild, interaction.user.id, snapshot, log);
+  // Cached here so the rank this refresh just paid for is what `/rank` answers from next, and so the
+  // store holds every successful lookup rather than only the ones `/rank` happened to make itself.
+  cacheRank(interaction.user.id, snapshot);
   await interaction.editReply({ ...buildMenuView({ kind: 'linked', account, snapshot }), ...note });
 }
 
@@ -275,6 +418,9 @@ async function handleModalSubmit(interaction: ModalSubmitInteraction, log: Logge
   // Stored only after the lookup succeeded: consent is captured by this flow, and a Riot ID that
   // could not be verified is not worth remembering.
   const account = linkAccount(interaction.user.id, { name: riotId.name, tag: riotId.tag });
+  // After the link, never before: `linkAccount` drops any rank cached for the previous Riot ID, and
+  // the snapshot just read belongs to the account that link now names.
+  cacheRank(interaction.user.id, snapshot);
   const note = await applyRankRole(guild, interaction.user.id, snapshot, log);
   await interaction.editReply({ ...buildMenuView({ kind: 'linked', account, snapshot }), ...note });
 }
@@ -404,6 +550,24 @@ const MANAGE_SERVER_REQUIRED =
   'You need the Manage Server permission to create the rank roles. Ask a server admin to run it.';
 
 const NOT_LINKED_MESSAGE = 'You have not linked a Riot ID yet. Run `/menu` and press **Link account** first.';
+
+/**
+ * The unlinked answer, worded for whoever is being told.
+ *
+ * Two phrasings rather than one because "you" would be wrong when the caller asked about somebody
+ * else. The third-party version says only that no link exists and how to make one: it reveals nothing
+ * about any account, which is the property that matters here — the whole point of the link is that
+ * an account is private until its owner agrees to it.
+ */
+function notLinkedMessage(subject: RankSubject, userId: string): string {
+  if (subject === 'self') {
+    return NOT_LINKED_MESSAGE;
+  }
+  return (
+    `<@${userId}> has not linked a VALORANT account to this bot, so there is no rank to show. ` +
+    'They can link one from `/menu`, and only then can anyone ask.'
+  );
+}
 
 const NO_ROLE_FOR_RANK =
   'Your rank is shown above, but this server has no role for it yet. Someone with **Manage Server** can press **Create rank roles** in `/menu`.';

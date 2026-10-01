@@ -191,7 +191,7 @@ describe('the no-numeric-tier-id invariant', () => {
    * enforced mechanically over the source instead of trusted to review.
    */
   it('never reads a tier id in any module of the feature', () => {
-    const modules = ['tiers.ts', 'provider.ts', 'role-sync.ts', 'view.ts', 'interaction.ts', 'messages.ts', 'store.ts', 'context.ts', 'regions.ts'];
+    const modules = ['tiers.ts', 'provider.ts', 'role-sync.ts', 'view.ts', 'interaction.ts', 'messages.ts', 'store.ts', 'context.ts', 'regions.ts', 'commands/menu.ts', 'commands/rank.ts'];
     for (const moduleName of modules) {
       const source = readFileSync(path.join(ranksDir, moduleName), 'utf8');
 

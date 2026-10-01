@@ -13,23 +13,27 @@
  * the guild, and nothing else.
  */
 
-import { Collection } from 'discord.js';
+import { ApplicationCommandOptionType, Collection, MessageFlags } from 'discord.js';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Logger } from '../../core/logger.js';
 import {
   applyRegistry,
+  collectSlashCommands,
   createRegistry,
   loadFeatures,
   resolveFeaturesDir,
   type EventBinding,
   type RegistryPlan,
 } from '../../core/registry.js';
+import { data as rankCommand } from './commands/rank.js';
 import { configureRankContext, resetRankContext } from './context.js';
-import { getLinkedAccount, linkAccount, resetLinkedAccounts } from './store.js';
+import { RANK_CACHE_TTL_MS } from './provider.js';
+import { cacheRank, getCachedRank, getLinkedAccount, linkAccount, resetLinkedAccounts } from './store.js';
 import { LINK_MODAL_ID, MENU_BUTTONS } from './view.js';
 
 const USER_ID = '111111111111111111';
+const OTHER_USER_ID = '222222222222222222';
 const MANAGE_ROLES = 1n << 28n;
 const MANAGE_GUILD = 1n << 5n;
 
@@ -206,6 +210,17 @@ async function dispatch(wiring: Wiring, interaction: unknown): Promise<void> {
   }
 }
 
+/**
+ * A reply payload as text.
+ *
+ * Read through `JSON.stringify` rather than through builder internals on purpose: these assertions
+ * are about what a member would read, and pinning them to `EmbedBuilder`'s private shape would make
+ * a refactor of the view look like a behaviour change.
+ */
+function repliedText(spy: Spy): string {
+  return JSON.stringify(spy.mock.calls[0]?.[0] ?? null);
+}
+
 /* -------------------------------------------------------------------------------------------- */
 /* Interaction payloads                                                                            */
 /* -------------------------------------------------------------------------------------------- */
@@ -216,12 +231,23 @@ async function dispatch(wiring: Wiring, interaction: unknown): Promise<void> {
  * The router only ever calls `isChatInputCommand()`. If the ranks handler's guard is ever moved
  * below a permission check, a component accessor, or anything else that inspects the payload, this
  * fake throws and names the mistake instead of letting the test pass on a silent early return.
+ *
+ * `target.member` fills the single `member` user option, so `/rank` can be exercised both ways
+ * without a second fake. `getUser` throws on any other option name, which is what stops a future
+ * `member`-plus-something-else command from being tested only through the path that happens to be
+ * written.
  */
-function chatInput(commandName: string) {
+function chatInput(commandName: string, target: { member?: string } = {}) {
   const reply: Spy = vi.fn().mockResolvedValue(undefined);
   const editReply: Spy = vi.fn().mockResolvedValue(undefined);
   const followUp: Spy = vi.fn().mockResolvedValue(undefined);
   const showModal: Spy = vi.fn().mockResolvedValue(undefined);
+  let deferred = false;
+  // The spy is the fake: recording the call and flipping the flag are the same act, so a test can
+  // never see a deferral that did not happen or a flag that moved without a recorded call.
+  const deferReply: Spy = vi.fn(async (_options: unknown): Promise<void> => {
+    deferred = true;
+  });
 
   const refuse = (accessor: string) => (): never => {
     throw new Error(`the ranks feature reached for ${accessor} on a chat-input interaction: the guard must come first`);
@@ -232,17 +258,29 @@ function chatInput(commandName: string) {
     editReply,
     followUp,
     showModal,
+    deferReply,
     interaction: {
       id: 'interaction-cmd',
       commandName,
       replied: false,
-      deferred: false,
+      get deferred(): boolean {
+        return deferred;
+      },
       isChatInputCommand: (): boolean => true,
       isButton: refuse('isButton'),
       isModalSubmit: refuse('isModalSubmit'),
       inGuild: (): boolean => true,
       guild: null,
       user: { id: USER_ID },
+      options: {
+        getUser: (name: string): { id: string } | null => {
+          if (name !== 'member') {
+            throw new Error(`the ranks feature read an option named "${name}", which /${commandName} does not declare`);
+          }
+          return target.member === undefined ? null : { id: target.member };
+        },
+      },
+      deferReply,
       reply,
       editReply,
       followUp,
@@ -665,5 +703,256 @@ describe('the link flow, end to end', () => {
     expect(guild.removed).toEqual([]);
     const payload = refresh.editReply.mock.calls[0]?.[0] as { content?: string };
     expect(payload.content).toMatch(/could not read your current roles/);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------- */
+/* The /rank command definition                                                                   */
+/* -------------------------------------------------------------------------------------------- */
+
+describe('the /rank command definition', () => {
+  it('declares exactly one option, and it is a user', () => {
+    expect(rankCommand.name).toBe('rank');
+    // `toMatchObject` on an array also pins the length, so a second option fails here rather than
+    // slipping past a check that only looked for the one it expected.
+    expect(rankCommand.options).toMatchObject([
+      { type: ApplicationCommandOptionType.User, name: 'member', required: false },
+    ]);
+  });
+
+  it('declares no option a Riot ID could be typed into', () => {
+    // The compliance constraint, asserted on the payload Discord will actually receive rather than
+    // in a comment. A string option here would let anybody look up anybody, which is the consent
+    // bypass the link flow exists to prevent, so it has to fail the build if it ever comes back.
+    const types = (rankCommand.options ?? []).map((option) => option.type);
+    expect(types).not.toContain(ApplicationCommandOptionType.String);
+    expect(types).not.toContain(ApplicationCommandOptionType.Attachment);
+  });
+
+  it("carries no permission gate, because reading a linked member's rank is public in the guild", () => {
+    expect(rankCommand.default_member_permissions).toBeUndefined();
+  });
+
+  it('is listed in the runtime manifest as well as on disk', async () => {
+    // Deployment publishes `commands/` and compares it with the manifests, refusing to publish when
+    // they disagree. This project has already shipped a command that was deployed and did nothing,
+    // so the agreement is checked mechanically for the new file too.
+    const manifest = createRegistry(await loadFeatures(resolveFeaturesDir()), []);
+    const onDisk = await collectSlashCommands(resolveFeaturesDir());
+
+    const diskNames = onDisk.map(({ command }) => command.data.name).sort();
+    expect(diskNames).toContain('rank');
+    expect(diskNames).toEqual([...manifest.commands.keys()].sort());
+  });
+});
+
+/* -------------------------------------------------------------------------------------------- */
+/* The /rank command                                                                              */
+/* -------------------------------------------------------------------------------------------- */
+
+describe('the /rank command', () => {
+  beforeEach(() => {
+    resetLinkedAccounts();
+  });
+
+  /**
+   * A provider stub that records every request it is asked to make.
+   *
+   * `status` is how a failure is provoked: the provider turns a status into its own typed error, so
+   * a 429 here is a real `RankRateLimitedError` travelling the real path rather than a thrown stub
+   * that skips the mapping the member would actually read.
+   */
+  function stubProvider(options: { readonly tierName?: string; readonly status?: number } = {}) {
+    const urls: string[] = [];
+    const fetchImpl = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+      urls.push(String(input));
+      return new Response(
+        JSON.stringify({
+          status: 200,
+          data: {
+            account: { name: 'Dipplox', tag: 'LPARG' },
+            current: { tier: { name: options.tierName ?? 'ASCENDANT 2' }, rr: 32, elo: 1932, games_needed_for_rating: 0 },
+          },
+        }),
+        { status: options.status ?? 200, headers: { 'content-type': 'application/json' } },
+      );
+    });
+    configureRankContext({ readApiKey: () => 'test-key', fetchImpl: fetchImpl as unknown as typeof fetch });
+    return { urls, fetchImpl };
+  }
+
+  /** Ages a member's cached rank past the provider's window, so the next run has to refetch. */
+  function expire(ranks: ReturnType<typeof getCachedRank>, userId: string): void {
+    if (ranks === null) {
+      throw new Error('the first run must have cached the rank it just fetched');
+    }
+    cacheRank(userId, ranks.snapshot, Date.now() - (RANK_CACHE_TTL_MS + 1_000));
+  }
+
+  it("resolves the caller's own stored rank when no member is given", async () => {
+    const wiring = await buildWiring();
+    const stub = stubProvider();
+    linkAccount(USER_ID, { name: 'Dipplox', tag: 'LPARG' });
+    const own = chatInput('rank');
+
+    await dispatch(wiring, own.interaction);
+
+    // The Riot ID came from the caller's own link, and the region from its tag rather than the user.
+    expect(stub.urls).toHaveLength(1);
+    expect(stub.urls[0]).toContain('/valorant/v3/mmr/latam/pc/Dipplox/LPARG');
+    expect(repliedText(own.editReply)).toContain('ASCENDANT 2');
+  });
+
+  it("resolves a named member's stored rank rather than the caller's", async () => {
+    const wiring = await buildWiring();
+    const stub = stubProvider();
+    linkAccount(USER_ID, { name: 'Caller', tag: 'EU1' });
+    linkAccount(OTHER_USER_ID, { name: 'Dipplox', tag: 'LPARG' });
+    const other = chatInput('rank', { member: OTHER_USER_ID });
+
+    await dispatch(wiring, other.interaction);
+
+    // The named member's account was requested, not the caller's: that is what the option is for.
+    expect(stub.urls[0]).toContain('/Dipplox/LPARG');
+    expect(stub.urls[0]).not.toContain('/Caller/EU1');
+    // And the answer says whose it is, so an ephemeral reply is not ambiguous about its subject.
+    expect(repliedText(other.editReply)).toContain(`<@${OTHER_USER_ID}>`);
+  });
+
+  it('answers an unlinked member locally, without spending a request or leaking an account', async () => {
+    const wiring = await buildWiring();
+    const stub = stubProvider();
+    linkAccount(USER_ID, { name: 'Dipplox', tag: 'LPARG' });
+    const other = chatInput('rank', { member: OTHER_USER_ID });
+
+    await dispatch(wiring, other.interaction);
+
+    // The refusal is a local fact, so it costs nothing and needs no provider to confirm it.
+    expect(stub.fetchImpl).not.toHaveBeenCalled();
+    expect(other.deferReply).not.toHaveBeenCalled();
+    expect(repliedText(other.reply)).toMatch(/has not linked/);
+    expect(repliedText(other.reply)).toContain(OTHER_USER_ID);
+    // Nothing about any account. An unlinked member consented to nothing, so there is nothing to
+    // reveal — not even the caller's own Riot ID, which is sitting in the store right here.
+    expect(repliedText(other.reply)).not.toContain('Dipplox');
+  });
+
+  it('serves a rank it already read without spending a second request', async () => {
+    const wiring = await buildWiring();
+    const stub = stubProvider();
+    linkAccount(USER_ID, { name: 'Dipplox', tag: 'LPARG' });
+    const first = chatInput('rank');
+
+    await dispatch(wiring, first.interaction);
+    expect(stub.fetchImpl).toHaveBeenCalledTimes(1);
+
+    const second = chatInput('rank');
+    await dispatch(wiring, second.interaction);
+
+    // Still one. The free tier allows 30 requests a minute, and re-running the command is the single
+    // most common thing anyone does with it.
+    expect(stub.fetchImpl).toHaveBeenCalledTimes(1);
+    expect(second.deferReply).not.toHaveBeenCalled();
+    // The answer says it came from the cache, so spending no request is visible to the reader
+    // instead of being a silent claim to be live.
+    expect(repliedText(second.reply)).toMatch(/cache/i);
+    expect(repliedText(second.reply)).toContain('ASCENDANT 2');
+  });
+
+  it("refreshes another member's stale rank and updates what it has stored", async () => {
+    const wiring = await buildWiring();
+    const stub = stubProvider();
+    linkAccount(OTHER_USER_ID, { name: 'Dipplox', tag: 'LPARG' });
+    await dispatch(wiring, chatInput('rank', { member: OTHER_USER_ID }).interaction);
+    expire(getCachedRank(OTHER_USER_ID), OTHER_USER_ID);
+    const stale = getCachedRank(OTHER_USER_ID);
+    stub.fetchImpl.mockClear();
+
+    const second = chatInput('rank', { member: OTHER_USER_ID });
+    await dispatch(wiring, second.interaction);
+
+    // Exactly one request, and the store now holds a newer reading of the same account.
+    expect(stub.fetchImpl).toHaveBeenCalledTimes(1);
+    const refreshed = getCachedRank(OTHER_USER_ID);
+    expect(refreshed?.fetchedAt).toBeGreaterThan(stale?.fetchedAt ?? 0);
+    expect(repliedText(second.editReply)).toMatch(/Fetched from the provider just now/);
+  });
+
+  it('keeps the rank it already had when the provider fails', async () => {
+    const wiring = await buildWiring();
+    stubProvider();
+    linkAccount(USER_ID, { name: 'Dipplox', tag: 'LPARG' });
+    await dispatch(wiring, chatInput('rank').interaction);
+    expire(getCachedRank(USER_ID), USER_ID);
+    const stale = getCachedRank(USER_ID);
+
+    // A rate limit is the failure a member will actually meet, and it must not be dressed up as a
+    // generic one: the message has to say when it is worth coming back.
+    configureRankContext({
+      readApiKey: () => 'test-key',
+      fetchImpl: (async () => new Response('{}', { status: 429 })) as unknown as typeof fetch,
+    });
+    const failing = chatInput('rank');
+
+    await dispatch(wiring, failing.interaction);
+
+    // A failed read erases nothing: the previous snapshot and its timestamp both survive, so the
+    // next run has something to serve if the provider is still unhappy.
+    const after = getCachedRank(USER_ID);
+    expect(after?.snapshot).toBe(stale?.snapshot);
+    expect(after?.fetchedAt).toBe(stale?.fetchedAt);
+    expect(repliedText(failing.editReply)).toMatch(/rate limit/i);
+    // The credential is one hop away from the request that failed, so it must not be in the reply.
+    expect(repliedText(failing.editReply)).not.toContain('test-key');
+  });
+
+  it('replies ephemerally on every path, so a rank is never broadcast by asking on someone', async () => {
+    const wiring = await buildWiring();
+    stubProvider();
+    linkAccount(USER_ID, { name: 'Dipplox', tag: 'LPARG' });
+
+    // The path that costs a request: the deferral is what carries the ephemeral flag.
+    const fetched = chatInput('rank');
+    await dispatch(wiring, fetched.interaction);
+    expect(fetched.deferReply).toHaveBeenCalledWith({ flags: MessageFlags.Ephemeral });
+
+    // The path that does not.
+    const cached = chatInput('rank');
+    await dispatch(wiring, cached.interaction);
+    expect(cached.reply).toHaveBeenCalledWith(expect.objectContaining({ flags: MessageFlags.Ephemeral }));
+
+    // And the refusal, so "they have not linked" is not posted to the channel either.
+    const unlinked = chatInput('rank', { member: '333333333333333333' });
+    await dispatch(wiring, unlinked.interaction);
+    expect(unlinked.reply).toHaveBeenCalledWith(expect.objectContaining({ flags: MessageFlags.Ephemeral }));
+  });
+
+  it('explains setup instead of spending a request when no key is configured', async () => {
+    configureRankContext({ readApiKey: () => undefined });
+    const wiring = await buildWiring();
+    linkAccount(USER_ID, { name: 'Dipplox', tag: 'LPARG' });
+    const own = chatInput('rank');
+
+    await dispatch(wiring, own.interaction);
+
+    expect(repliedText(own.reply)).toMatch(/HENRIK_DEV_API_KEY/);
+    expect(own.deferReply).not.toHaveBeenCalled();
+  });
+
+  it("is answered by the router alone, never by the feature's own listener", async () => {
+    const wiring = await buildWiring();
+    stubProvider();
+    linkAccount(USER_ID, { name: 'Dipplox', tag: 'LPARG' });
+    const own = chatInput('rank');
+
+    await dispatch(wiring, own.interaction);
+
+    // One acknowledgement. The feature handler ran and touched nothing: the fake throws if it ever
+    // inspects a chat-input payload, and the router produced the only reply.
+    expect(wiring.commandSpy('rank')).toHaveBeenCalledTimes(1);
+    expect(own.deferReply).toHaveBeenCalledTimes(1);
+    expect(own.editReply).toHaveBeenCalledTimes(1);
+    expect(own.reply).not.toHaveBeenCalled();
+    expect(wiring.featureSpy).toHaveBeenCalledTimes(1);
   });
 });

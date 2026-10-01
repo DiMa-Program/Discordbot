@@ -21,6 +21,7 @@ they are native, need no custom frontend, and work inside the client the user is
 
 IN:
 - `/menu` as the single entry point, no arguments
+- `/rank` as the read: your own rank, or a named member's, ephemeral, user option only
 - Button `[Vincular cuenta]` opens a **modal** with a single text field (Riot ID)
 - Region is **inferred from the Riot ID tag** with automatic fallback across all affinities
 - Button `[Actualizar rango]` fetches, renders an embed, and syncs the rank role
@@ -42,6 +43,10 @@ OUT:
 - All artifacts in English.
 - Provider terms **require explicit per-user consent**. The link flow is the consent capture and must
   be recorded, not implied.
+- Consequently `/rank` accepts a **Discord user option only**. A Riot ID parameter would let anyone
+  look up anyone, which is the bypass of the consent flow: *"Analytic services where the user isn't
+  giving his consent are not supported and will be banned if found out"*. The option shape is
+  asserted in a test so the parameter cannot be reintroduced unnoticed.
 - Never request `Administrator`.
 - TypeScript strict + NodeNext ESM; relative imports need the `.js` extension.
 - No edits to `tsconfig.json`, `package.json` or the foundation features.
@@ -89,6 +94,7 @@ a closed union validated before any request is spent.
 - [x] T8 — `features/ranks/ui/`: `/menu` command, modal, buttons, embeds
 - [x] T9 — unit tests for all pure logic
 - [x] T10 — README: permission change, consent flow, boost caveat
+- [x] T11 — `/rank`: read a linked member's rank, user option only, 300 s rank cache in the store
 
 ## Acceptance criteria
 
@@ -132,6 +138,17 @@ Parent-verified after implementation, not taken on report:
 - Install link regenerated: `permissions=268453888`, listing `SendMessages`, `EmbedLinks`, `ManageRoles`
   and still explicitly not `Administrator` or `ManageGuild`
 
+Re-verified after `/rank` (T11) was added:
+
+- `npm run typecheck` — exit 0
+- `npm test` — 10 files passed, **208 tests passed** (186 before this change)
+- `npm run build` — exit 0
+- Deployed payload printed from `dist/features/ranks/commands/rank.js`: exactly one option,
+  `{"name":"member","type":6}` (type 6 = USER), no string option, no `default_member_permissions`
+- The three new cache/route behaviours were mutation-checked rather than assumed: disabling the cache
+  read, adding a string option, and clearing the cache on failure each turned the suite red
+  (2, 2 and 1 failing tests respectively) before being reverted.
+
 ## Plan corrections made during implementation
 
 1. **The ladder is 26 ranks, not 25.** The original plan said "24 ranked tiers + UNRANKED = 25" while
@@ -161,7 +178,7 @@ Parent-verified after implementation, not taken on report:
 1. **Grant `ManageRoles`**: Server Settings → Roles → the bot's role → tick Manage Roles. No reinstall
    needed; the existing install bitfield only applies to new installs. The feature reads the
    permission live, so it takes effect on the next `/menu` without a restart.
-2. **Run `npm run deploy:commands`** — `/menu` does not exist in Discord until deployed.
+2. **Run `npm run deploy:commands`** — `/menu` and `/rank` do not exist in Discord until deployed.
 3. **The bot's role must sit above the rank roles.** `ensureRankRoles` creates them at the bottom of
    the hierarchy, which is normally correct; if the bot's role is dragged below them afterwards,
    assignment fails with a message naming the exact knob to turn.
@@ -172,7 +189,9 @@ Parent-verified after implementation, not taken on report:
 ## Known limitations
 
 - Links are in-memory and die on restart, matching `welcome/greeting-store.ts`.
-- Ranks are cached by the provider for 300s on the free tier; the UI never claims live data.
+- Ranks are cached by the provider for 300s on the free tier; the UI never claims live data. The
+  store now also holds the last rank read per member, for the same 300s window, so `/rank` costs no
+  request when it is re-run. A failed read leaves the previous entry standing rather than clearing it.
 - Roles match by exact name, so a hand-made `Gold 2` with a different colour is adopted rather than
   duplicated. Intentional for idempotency, but it means the catalog colour is not enforced on
   pre-existing roles.

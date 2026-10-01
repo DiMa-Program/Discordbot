@@ -164,6 +164,9 @@ immediately, and the feature then says so instead of failing.
 `/menu` links a member's Riot ID, reads their competitive rank and keeps exactly one rank role on
 them. It takes no arguments: everything happens through buttons and one text field.
 
+`/rank` is the read. With no argument it shows your own rank; with `member:` it shows theirs, but
+only if they have linked an account. Both replies are ephemeral.
+
 ### Quick path
 
 1. Add `HENRIK_DEV_API_KEY` to `.env` and restart. Without it the feature is inert and `/menu`
@@ -171,7 +174,26 @@ them. It takes no arguments: everything happens through buttons and one text fie
 2. Run `/menu` → **Create rank roles** (needs *Manage Server*). This creates all 26 roles, and is
    safe to run twice.
 3. Run `/menu` → **Link account** → paste a Riot ID like `SomePlayer#EU1`.
-4. The rank role is applied immediately. Use **Refresh rank** to re-check.
+4. The rank role is applied immediately. Use **Refresh rank** to re-check, or `/rank` to read it.
+
+### `/rank`
+
+| You run | You get |
+|---------|---------|
+| `/rank` | Your rank, from your own link. |
+| `/rank member:@someone` | Their rank — but only if they linked an account. |
+| `/rank member:@someone` and they never linked | A note saying so, and **no request is sent**. |
+
+**It takes a member, never a Riot ID, and that is not an oversight.** A Riot ID option would let
+anyone look up any player. The provider's terms do not support analytics a player has not consented
+to, and Riot's policy does not allow exposing a player's data without opt-in — so the link *is* the
+consent and there is deliberately no second way in. A test asserts the command's option shape, so a
+string option cannot come back unnoticed.
+
+The answer is **ephemeral**, including when you ask about somebody else: using the command on a
+member is not a way to publish their rank to the channel. There is **no permission gate**, for the
+same reason — reading a linked member's rank is public within the server, because linking already
+agreed to it.
 
 ### What the user does, and what they never do
 
@@ -194,6 +216,7 @@ which is what rescues a South American player whose tag does not match.
 | Behaviour | Why |
 |-----------|-----|
 | A promotion takes a few minutes to show | The free tier caches responses for **300 seconds**. The UI never claims the data is live. |
+| `/rank` answered from a cache, with no request | A rank younger than **300 seconds** is already in memory, so re-running the command costs nothing against the 30-requests-per-minute free tier. The answer says it was cached, so it never reads as a live one. |
 | Ranks are named `Ascendant 2`, not `ASCENDANT 2` | Tiers are matched on the **normalised name**, never on Riot's tier id. Riot renumbered every id from 21 up when Ascendant arrived, so an id-based mapping silently assigns the wrong role. A test scans the source to keep it that way. |
 | Roles have plain colours, no icons | Role icons require **Server Boost level 2**. Out of our control. |
 | Links are lost on restart | Storage is an in-memory `Map`, like `welcome/greeting-store.ts`. Members relink after a deploy. |
@@ -352,7 +375,7 @@ src/
   features/
     ping/                      reference feature: one command
     welcome/                   reference feature: one event handler + toggle command
-    ranks/                     VALORANT rank roles: /menu, modal, buttons, provider, role sync
+    ranks/                     VALORANT rank roles: /menu, /rank, modal, buttons, provider, role sync
 ```
 
 Pure logic is separated from discord.js objects on purpose: `permissions.ts`, `registry.ts` and
@@ -379,6 +402,8 @@ same split inside its folder — `tiers.ts`, `regions.ts` and `role-sync.ts` hol
 | Rank role is not applied | The rank role sits at or above the bot's own role | Move the bot's role higher in Server Settings → Roles. |
 | "This server has no role for that rank yet" | The 26 roles were never created | Press **Create rank roles** in `/menu` as someone with Manage Server. |
 | A promotion does not show up | The free tier caches for 300 seconds | Wait five minutes, then **Refresh rank**. |
+| `/rank` not in the picker | The command was never deployed | Run `npm run deploy:commands` again. |
+| `/rank` says a member has not linked | They never used **Link account** | Expected. Nothing is looked up until they link. |
 | Everyone had to relink | Links live in memory and die with the process | Expected. Replace `ranks/store.ts` with a real store. |
 | `feature manifests and the commands/ tree disagree` | A command file is not listed in its feature `index.ts` | Add it to the `commands` array, or remove the file. |
 | `duplicate command name: the first registration wins` | Two features claim the same command name | Rename one of them. |
@@ -392,4 +417,6 @@ same split inside its folder — `tiers.ts`, `regions.ts` and `role-sync.ts` hol
 - [ ] `npm run invite` prints a URL containing `permissions=268453888` and no administrator bit.
 - [ ] `/ping` replies after installing.
 - [ ] `/menu` shows the menu; **Create rank roles** creates 26 roles and is safe to run twice.
+- [ ] `/rank` replies ephemerally with your own rank; `/rank member:@someone` works for a linked
+      member and refuses an unlinked one.
 - [ ] `.env` is gitignored and was never committed.
