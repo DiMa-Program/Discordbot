@@ -73,7 +73,10 @@ if (!hasRemote) {
 rmSync(outputDir, { recursive: true, force: true });
 mkdirSync(outputDir, { recursive: true });
 
-const archiveName = `discordbot-${branch}-${shortSha}.zip`;
+// Branch names legitimately contain slashes (`feature/rank-sync`), which would otherwise become a
+// path separator in the archive name and make git fail to create the file.
+const branchSlug = branch.replace(/[^A-Za-z0-9._-]+/g, '-');
+const archiveName = `discordbot-${branchSlug}-${shortSha}.zip`;
 const archivePath = path.join(outputDir, archiveName);
 
 execFileSync('git', ['archive', '--format=zip', `-o${archivePath}`, 'HEAD'], { cwd: projectRoot });
