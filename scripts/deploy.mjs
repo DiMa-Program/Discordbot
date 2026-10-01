@@ -463,6 +463,11 @@ try {
 
   const fileCount = (output.match(/^([A-Za-z]:\\|[^:]+)$/gm) ?? []).length;
   console.log(`[deploy] uploaded${fileCount > 0 ? ` (${fileCount} paths)` : ''}.`);
+  if (process.env['DEPLOY_VERBOSE'] === '1') {
+    console.log('[deploy] --- raw winscp output ---');
+    console.log(output);
+    console.log('[deploy] --- end raw output ---');
+  }
 
   // The trailing `ls` in the script reports what the host actually holds after the transfer. This
   // is the only trustworthy signal that the new build arrived: the transfer itself succeeds whether
