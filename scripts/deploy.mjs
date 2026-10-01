@@ -350,6 +350,15 @@ try {
 
   cpSync(builtDist, path.join(stagingDir, 'dist'), { recursive: true });
 
+  // The upload is reported as successful whether or not it carried the build, so the number of
+  // compiled files now staged is stated before the transfer. A count of zero here means the host
+  // would keep running the previous build while the deploy still printed success, which is exactly
+  // the failure this step exists to make impossible.
+  const stagedBuildFiles = readdirSync(path.join(stagingDir, 'dist'), { recursive: true }).filter(
+    (entry) => typeof entry === 'string' && entry.endsWith('.js'),
+  ).length;
+  console.log(`[deploy] staged ${stagedBuildFiles} compiled files.`);
+
   // -------------------------------------------------------------------------------------------
   // 5. Upload over SFTP
   // -------------------------------------------------------------------------------------------
