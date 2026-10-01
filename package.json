@@ -5,7 +5,7 @@
   "description": "Extensible Discord bot with OAuth2 server installation and least-privilege permissions",
   "type": "module",
   "engines": {
-    "node": ">=20.9.0"
+    "node": ">=22.5.0"
   },
   "main": "dist/index.js",
   "scripts": {

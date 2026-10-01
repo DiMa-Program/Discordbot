@@ -35,7 +35,7 @@ from.
 
 | Requirement | Version | Notes |
 |-------------|---------|-------|
-| Node.js | 20.9 or newer | ESM only (`"type": "module"`). Node 24 recommended. |
+| Node.js | **22.5.0 or newer** | Required by `node:sqlite`, which the persistence layer uses. On Node 22 it is experimental; it is stable on Node 24, which is recommended. A host pinned to Node 18 or 20 will fail to boot. |
 | Discord account | — | Needed to create the application. |
 | A Discord server | — | Your own test server is enough. |
 
