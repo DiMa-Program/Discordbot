@@ -31,6 +31,7 @@ describe('validateEnv', () => {
       devGuildId: null,
       logLevel: 'info',
       enablePrivilegedIntents: false,
+      henrikDevApiKey: null,
     });
   });
 
@@ -106,6 +107,30 @@ describe('validateEnv', () => {
     expect(configOf({ ...VALID_ENV, PATH: 'C:\\Windows', NODE_ENV: 'test' }).clientId).toBe(
       '123456789012345678',
     );
+  });
+});
+
+describe('the optional rank provider key', () => {
+  it('stays null when it is absent, so the ranks feature can stay inert', () => {
+    expect(configOf(VALID_ENV).henrikDevApiKey).toBeNull();
+  });
+
+  it('keeps a configured key, trimmed', () => {
+    expect(configOf({ ...VALID_ENV, HENRIK_DEV_API_KEY: '  key-123  ' }).henrikDevApiKey).toBe('key-123');
+  });
+
+  it('never requires it, so a bot without ranks still boots', () => {
+    const result = validateEnv(VALID_ENV);
+    expect(result.ok).toBe(true);
+  });
+
+  it('reports a blank value instead of pretending the feature is off', () => {
+    // `HENRIK_DEV_API_KEY=` is a copy/paste that lost the value, not an opt-out. Swallowing it
+    // would surface as a rank lookup that silently never works.
+    const issues = issuesOf({ ...VALID_ENV, HENRIK_DEV_API_KEY: '   ' });
+    expect(issues[0]?.variable).toBe('HENRIK_DEV_API_KEY');
+    expect(issues[0]?.problem).toMatch(/delete the line/);
+    expect(issues[0]?.hint).toContain('henrikdev.xyz');
   });
 });
 

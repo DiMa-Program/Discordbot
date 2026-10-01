@@ -24,6 +24,7 @@ describe('least-privilege permission set', () => {
     expect(REQUIRED_PERMISSIONS).toEqual([
       PermissionsBitField.Flags.SendMessages,
       PermissionsBitField.Flags.EmbedLinks,
+      PermissionsBitField.Flags.ManageRoles,
     ]);
   });
 
@@ -35,9 +36,9 @@ describe('least-privilege permission set', () => {
   });
 
   it('ORs the flags into the bitfield Discord expects', () => {
-    // SendMessages (2048) | EmbedLinks (16384)
-    expect(resolvePermissionBits()).toBe(2048n | 16384n);
-    expect(resolvePermissionBits().toString()).toBe('18432');
+    // SendMessages (2048) | EmbedLinks (16384) | ManageRoles (268435456)
+    expect(resolvePermissionBits()).toBe(2048n | 16384n | 268435456n);
+    expect(resolvePermissionBits().toString()).toBe('268453888');
   });
 
   it('refuses to build a bitfield that contains a forbidden permission', () => {
@@ -63,13 +64,30 @@ describe('buildInstallUrl', () => {
     expect(`${url.origin}${url.pathname}`).toBe(AUTHORIZE_ENDPOINT);
     expect(url.searchParams.get('client_id')).toBe('123456789012345678');
     expect(url.searchParams.get('scope')).toBe('bot applications.commands');
-    expect(url.searchParams.get('permissions')).toBe('18432');
+    expect(url.searchParams.get('permissions')).toBe('268453888');
   });
 
   it('matches the URL shape discord.js itself produces', () => {
     // Client#generateInvite builds `?client_id=..&scope=..&permissions=..` in that order.
     const query = new URL(buildInstallUrl('123456789012345678')).search;
-    expect(query).toBe('?client_id=123456789012345678&scope=bot+applications.commands&permissions=18432');
+    expect(query).toBe(
+      '?client_id=123456789012345678&scope=bot+applications.commands&permissions=268453888',
+    );
+  });
+
+  it('asks for ManageRoles without ever asking for role administration powers', () => {
+    // ManageRoles is the only role bit the bot may hold. BanMembers, KickMembers and
+    // ManageNicknames would all be a privilege escalation for a feature that only colours names.
+    const bits = resolvePermissionBits();
+    expect(bits & PermissionsBitField.Flags.ManageRoles).toBe(PermissionsBitField.Flags.ManageRoles);
+    for (const escalation of [
+      PermissionsBitField.Flags.BanMembers,
+      PermissionsBitField.Flags.KickMembers,
+      PermissionsBitField.Flags.ManageNicknames,
+      PermissionsBitField.Flags.ManageWebhooks,
+    ]) {
+      expect(bits & escalation).toBe(0n);
+    }
   });
 
   it('never emits the Administrator bit, alone or as part of a full-admin set', () => {
@@ -105,6 +123,7 @@ describe('describePermissionGrants', () => {
     expect(lines).toHaveLength(REQUIRED_PERMISSIONS.length);
     expect(lines.join('\n')).toContain('SendMessages');
     expect(lines.join('\n')).toContain('EmbedLinks');
+    expect(lines.join('\n')).toContain('ManageRoles');
   });
 
   it('never renders a permission as "[object Object]"', () => {
@@ -118,6 +137,7 @@ describe('permissionName', () => {
   it('resolves bit values to their Discord names', () => {
     expect(permissionName(PermissionsBitField.Flags.SendMessages)).toBe('SendMessages');
     expect(permissionName(PermissionsBitField.Flags.EmbedLinks)).toBe('EmbedLinks');
+    expect(permissionName(PermissionsBitField.Flags.ManageRoles)).toBe('ManageRoles');
     expect(permissionName(PermissionsBitField.Flags.Administrator)).toBe('Administrator');
   });
 

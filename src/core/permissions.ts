@@ -68,7 +68,14 @@ export interface PermissionGrant {
  * The complete install-time permission set.
  *
  * `SendMessages` covers slash-command replies and the opt-in welcome greeting.
- * `EmbedLinks` covers rich command replies. Nothing else is required by the shipped features.
+ * `EmbedLinks` covers rich command replies.
+ * `ManageRoles` covers creating the VALORANT rank roles and applying the right one to a member.
+ *
+ * `ManageRoles` is requested at install time rather than checked at runtime only, because a
+ * server owner has to grant it through the OAuth2 consent screen or the bot cannot ever create
+ * the roles it is built to manage. It is still the narrowest bit that does the job: it grants no
+ * ability to touch anything except roles, and the role hierarchy check in
+ * `features/ranks/role-sync.ts` still applies on top of it.
  */
 export const PERMISSION_GRANTS: readonly PermissionGrant[] = [
   {
@@ -78,6 +85,10 @@ export const PERMISSION_GRANTS: readonly PermissionGrant[] = [
   {
     permission: PermissionFlagsBits.EmbedLinks,
     reason: 'Render command replies as rich embeds instead of plain text.',
+  },
+  {
+    permission: PermissionFlagsBits.ManageRoles,
+    reason: 'Create the VALORANT rank roles and keep the correct one assigned to each member.',
   },
 ];
 

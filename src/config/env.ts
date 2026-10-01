@@ -38,6 +38,8 @@ const HINTS: Readonly<Record<string, string>> = {
   LOG_LEVEL: `Optional. One of: ${LOG_LEVELS.join(', ')}.`,
   ENABLE_PRIVILEGED_INTENTS:
     'Optional. "true" also requests the privileged gateway intents that features declare. Those must additionally be ticked in Discord Developer Portal > Bot > Privileged Gateway Intents.',
+  HENRIK_DEV_API_KEY:
+    'Optional. Delete the line entirely to run without the ranks feature. If you keep it, it must hold a real key from https://henrikdev.xyz/account, never a blank value.',
 };
 
 function toBoolean(literal: string): boolean {
@@ -66,6 +68,18 @@ const envSchema = z.object({
     .enum(BOOLEAN_LITERALS, { error: `must be one of: ${BOOLEAN_LITERALS.join(', ')}` })
     .default('false')
     .transform(toBoolean),
+  /**
+   * Optional on purpose: the bot must boot and serve every other command when it is absent.
+   *
+   * A blank value is a mistake rather than an absence, so it is reported the same way a blank
+   * `DISCORD_TOKEN` is: silently treating `KEY=` as "no key" would hide a copy/paste that lost
+   * the value and only surface later as a rank lookup that never works.
+   */
+  HENRIK_DEV_API_KEY: z
+    .string()
+    .trim()
+    .min(1, 'must not be empty — delete the line instead of leaving it blank')
+    .optional(),
 });
 
 /**
@@ -87,6 +101,13 @@ export interface EnvConfig {
   readonly devGuildId: string | null;
   readonly logLevel: LogLevel;
   readonly enablePrivilegedIntents: boolean;
+  /**
+   * Key for the third-party rank provider, or `null` when the operator did not configure one.
+   *
+   * Consumers must treat `null` as "this feature is switched off" and stay inert rather than
+   * failing: an optional dependency may never take the whole bot down.
+   */
+  readonly henrikDevApiKey: string | null;
 }
 
 /** A single configuration problem plus the remediation text for it. */
@@ -130,6 +151,7 @@ export function validateEnv(input: unknown): EnvValidationResult {
       devGuildId: parsed.data.DISCORD_DEV_GUILD_ID ?? null,
       logLevel: parsed.data.LOG_LEVEL,
       enablePrivilegedIntents: parsed.data.ENABLE_PRIVILEGED_INTENTS,
+      henrikDevApiKey: parsed.data.HENRIK_DEV_API_KEY ?? null,
     },
   };
 }
