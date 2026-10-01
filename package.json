@@ -16,7 +16,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "deploy:commands": "tsx src/scripts/deploy-commands.ts",
-    "invite": "tsx src/scripts/print-invite.ts"
+    "invite": "tsx src/scripts/print-invite.ts",
+    "package": "node scripts/package-deploy.mjs"
   },
   "dependencies": {
     "discord-api-types": "^0.38.56",
