@@ -25,6 +25,20 @@ export type BooleanLiteral = (typeof BOOLEAN_LITERALS)[number];
 const SNOWFLAKE_PATTERN = /^\d{17,20}$/;
 
 /**
+ * The default automatic-sync interval: 12 hours.
+ *
+ * Exported rather than written inline so the schema, the boot log and `.env.example` cannot disagree
+ * about what "unset" means. Twelve hours is deliberately uninteresting: the free tier allows 30
+ * requests a minute and this bot's measured use is a fraction of one percent of that, while a
+ * member's ladder placement is unlikely to move more often. Nothing here is a rate-limit decision —
+ * the staggered scheduler is — so this is only "how long may a promotion take to appear".
+ */
+export const DEFAULT_RANK_SYNC_INTERVAL_MINUTES = 720;
+
+/** Digits only, so `0`, `-5` and `12.5` are all rejected with the same actionable message. */
+const POSITIVE_INTEGER_PATTERN = /^[1-9][0-9]*$/;
+
+/**
  * Remediation text per variable. Attached to every issue so a failure tells the reader
  * exactly where to look instead of only what went wrong.
  */
@@ -40,6 +54,7 @@ const HINTS: Readonly<Record<string, string>> = {
     'Optional. "true" also requests the privileged gateway intents that features declare. Those must additionally be ticked in Discord Developer Portal > Bot > Privileged Gateway Intents.',
   HENRIK_DEV_API_KEY:
     'Optional. Delete the line entirely to run without the ranks feature. If you keep it, it must hold a real key from https://henrikdev.xyz/account, never a blank value.',
+  RANK_SYNC_INTERVAL_MINUTES: `Optional. Whole number of minutes between automatic rank refreshes. Default: ${DEFAULT_RANK_SYNC_INTERVAL_MINUTES} (12 hours). Values below 5 cannot return fresher data, because the provider itself caches for five minutes.`,
 };
 
 function toBoolean(literal: string): boolean {
@@ -80,6 +95,24 @@ const envSchema = z.object({
     .trim()
     .min(1, 'must not be empty — delete the line instead of leaving it blank')
     .optional(),
+  /**
+   * Minutes between automatic rank refreshes, as a positive whole number of minutes.
+   *
+   * VALIDATED AS A STRING AND ONLY THEN PARSED, because `z.coerce.number()` on `"twelve"` produces
+   * `NaN` and an `invalid_type` issue whose text names `NaN` rather than the variable's problem.
+   * The regex is the same shape as the boolean literal list above: one actionable message for every
+   * spelling of "that is not a duration".
+   *
+   * A blank value is reported rather than treated as unset, for the same reason
+   * `HENRIK_DEV_API_KEY=` is: `RANK_SYNC_INTERVAL_MINUTES=` is a copy/paste that lost the number,
+   * and quietly answering it with a default would hide the mistake behind a working bot.
+   */
+  RANK_SYNC_INTERVAL_MINUTES: z
+    .string({ error: 'must be a whole number of minutes' })
+    .trim()
+    .regex(POSITIVE_INTEGER_PATTERN, 'must be a positive whole number of minutes')
+    .default(String(DEFAULT_RANK_SYNC_INTERVAL_MINUTES))
+    .transform((value) => Number.parseInt(value, 10)),
 });
 
 /**
@@ -108,6 +141,14 @@ export interface EnvConfig {
    * failing: an optional dependency may never take the whole bot down.
    */
   readonly henrikDevApiKey: string | null;
+  /**
+   * Minutes between automatic rank refreshes, already validated as a positive integer.
+   *
+   * A number rather than a string because every consumer wants milliseconds or a divisor, and
+   * re-parsing a value the schema already checked is where a second, laxer rule creeps in. The
+   * default is applied in the schema, so this is never absent.
+   */
+  readonly rankSyncIntervalMinutes: number;
 }
 
 /** A single configuration problem plus the remediation text for it. */
@@ -152,6 +193,7 @@ export function validateEnv(input: unknown): EnvValidationResult {
       logLevel: parsed.data.LOG_LEVEL,
       enablePrivilegedIntents: parsed.data.ENABLE_PRIVILEGED_INTENTS,
       henrikDevApiKey: parsed.data.HENRIK_DEV_API_KEY ?? null,
+      rankSyncIntervalMinutes: parsed.data.RANK_SYNC_INTERVAL_MINUTES,
     },
   };
 }

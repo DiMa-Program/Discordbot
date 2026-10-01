@@ -29,8 +29,16 @@ import {
 import { data as rankCommand } from './commands/rank.js';
 import { configureRankContext, resetRankContext } from './context.js';
 import { RANK_CACHE_TTL_MS } from './provider.js';
-import { cacheRank, getCachedRank, getLinkedAccount, linkAccount, resetLinkedAccounts } from './store.js';
-import { LINK_MODAL_ID, MENU_BUTTONS } from './view.js';
+import {
+  cacheRank,
+  getCachedRank,
+  getLinkedAccount,
+  getPromptDecision,
+  linkAccount,
+  resetLinkedAccounts,
+  resetPromptDecisions,
+} from './store.js';
+import { LINK_MODAL_ID, MENU_BUTTONS, PROMPT_BUTTONS, RIOT_ID_FIELD } from './view.js';
 
 const USER_ID = '111111111111111111';
 const OTHER_USER_ID = '222222222222222222';
@@ -159,8 +167,10 @@ async function buildWiring() {
   const features = await loadFeatures(resolveFeaturesDir());
   const plan = createRegistry(features, []);
 
-  const ranksBinding = plan.bindings.find((binding) => binding.feature === 'ranks');
-  if (ranksBinding === undefined || ranksBinding.event !== 'interactionCreate') {
+  const ranksBinding = plan.bindings.find(
+    (binding) => binding.feature === 'ranks' && binding.event === 'interactionCreate',
+  );
+  if (ranksBinding === undefined) {
     throw new Error('the ranks feature must declare an interactionCreate handler for this test to mean anything');
   }
 
@@ -179,8 +189,13 @@ async function buildWiring() {
     ...plan,
     commands: tracedCommands,
     commandData: plan.commandData,
+    // ONLY the interactionCreate binding is replaced. The ranks join handler is left intact, because
+    // tracing it with the same spy would make "the prompt ran" indistinguishable from "a component
+    // interaction reached this feature".
     bindings: plan.bindings.map((binding: EventBinding) =>
-      binding.feature === 'ranks' ? { ...binding, handler: featureSpy } : binding,
+      binding.feature === 'ranks' && binding.event === 'interactionCreate'
+        ? { ...binding, handler: featureSpy }
+        : binding,
     ),
   };
 
@@ -207,6 +222,13 @@ type Wiring = Awaited<ReturnType<typeof buildWiring>>;
 async function dispatch(wiring: Wiring, interaction: unknown): Promise<void> {
   for (const handler of wiring.listeners.get('interactionCreate') ?? []) {
     await handler(interaction);
+  }
+}
+
+/** Sends one event to every listener bound to `event`, as the gateway would. */
+async function dispatchEvent(wiring: Wiring, event: string, payload: unknown): Promise<void> {
+  for (const handler of wiring.listeners.get(event) ?? []) {
+    await handler(payload);
   }
 }
 
@@ -290,11 +312,15 @@ function chatInput(commandName: string, target: { member?: string } = {}) {
 }
 
 /** A button that also claims a chat-input command name, so a double-handle is observable. */
-function button(customId: string, options: { guild?: unknown; permissions?: bigint[] } = {}) {
+function button(
+  customId: string,
+  options: { guild?: unknown; permissions?: bigint[]; userId?: string } = {},
+) {
   const reply: Spy = vi.fn().mockResolvedValue(undefined);
   const showModal: Spy = vi.fn().mockResolvedValue(undefined);
   const editReply: Spy = vi.fn().mockResolvedValue(undefined);
   const followUp: Spy = vi.fn().mockResolvedValue(undefined);
+  const update: Spy = vi.fn().mockResolvedValue(undefined);
   let deferred = false;
   const held = options.permissions ?? [];
 
@@ -303,6 +329,7 @@ function button(customId: string, options: { guild?: unknown; permissions?: bigi
     showModal,
     editReply,
     followUp,
+    update,
     interaction: {
       id: 'interaction-btn',
       customId,
@@ -318,9 +345,10 @@ function button(customId: string, options: { guild?: unknown; permissions?: bigi
       isModalSubmit: (): boolean => false,
       inGuild: (): boolean => true,
       guild: options.guild ?? null,
-      user: { id: USER_ID },
+      user: { id: options.userId ?? USER_ID },
       memberPermissions: { has: (bit: bigint): boolean => held.includes(bit) },
       showModal,
+      update,
       deferUpdate: async (): Promise<void> => {
         deferred = true;
       },
@@ -330,6 +358,30 @@ function button(customId: string, options: { guild?: unknown; permissions?: bigi
       reply,
       editReply,
       followUp,
+    },
+  };
+}
+
+/**
+ * A joining member, with a direct-message channel that records what it was sent.
+ *
+ * `guild` is the smallest thing that satisfies BOTH `guildMemberAdd` listeners the bot now binds:
+ * the ranks one reads `member.user` and `member.guild.id`, and the welcome one reads the greeting
+ * settings plus `guild.channels.cache`. Greetings are off by default, so the welcome handler is
+ * exercised here only in its "stays quiet" sense — which is the half that matters, because it shares
+ * the event with the prompt.
+ */
+function joiningMember(options: { readonly bot?: boolean } = {}) {
+  const send: Spy = vi.fn(async (_payload: unknown): Promise<void> => undefined);
+  const channelSend: Spy = vi.fn(async (_payload: unknown): Promise<void> => undefined);
+
+  return {
+    send,
+    channelSend,
+    member: {
+      id: USER_ID,
+      guild: { id: 'guild-1', channels: { cache: new Map() } },
+      user: { id: USER_ID, bot: options.bot ?? false, send, displayAvatarURL: () => 'avatar' },
     },
   };
 }
@@ -370,6 +422,134 @@ function modalSubmit(customId: string, value: string, guild: unknown) {
 
 beforeEach(() => {
   resetRankContext();
+  resetLinkedAccounts();
+  resetPromptDecisions();
+});
+
+/* -------------------------------------------------------------------------------------------- */
+/* The join prompt, through the real wiring                                                        */
+/* -------------------------------------------------------------------------------------------- */
+
+describe('the join prompt, wired through the registry', () => {
+  function stubProvider() {
+    const fetchImpl = vi.fn();
+    configureRankContext({ readApiKey: () => 'test-key', fetchImpl: fetchImpl as unknown as typeof fetch });
+    return fetchImpl;
+  }
+
+  /** The same stub, but answering a lookup, for the test that follows the prompt all the way. */
+  function stubProviderWithRank(tierName = 'GOLD 1') {
+    const fetchImpl = vi.fn(async (_input: string | URL | Request): Promise<Response> =>
+      new Response(
+        JSON.stringify({
+          status: 200,
+          data: {
+            account: { name: 'Dipplox', tag: 'LPARG' },
+            current: { tier: { name: tierName }, rr: 21, elo: 1300, games_needed_for_rating: 0 },
+          },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      ),
+    );
+    configureRankContext({ readApiKey: () => 'test-key', fetchImpl: fetchImpl as unknown as typeof fetch });
+    return fetchImpl;
+  }
+
+  it('asks the joining member once, through the ranks guildMemberAdd listener', async () => {
+    const fetchImpl = stubProvider();
+    const wiring = await buildWiring();
+    const joining = joiningMember();
+
+    await dispatchEvent(wiring, 'guildMemberAdd', joining.member);
+
+    expect(joining.send).toHaveBeenCalledTimes(1);
+    // Asking is not consent: the provider is configured and reachable, and is still not touched.
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(getPromptDecision(USER_ID)).toBeNull();
+  });
+
+  it('runs alongside the welcome handler instead of replacing it', async () => {
+    stubProvider();
+    const wiring = await buildWiring();
+
+    // Both features declare this event, so both listeners are bound and both run. Greetings are off
+    // for an unconfigured guild, so the welcome half of the claim is "stayed quiet" — which is the
+    // half that can actually break here, by throwing before the prompt is sent.
+    expect(wiring.listeners.get('guildMemberAdd')).toHaveLength(2);
+    const joining = joiningMember();
+    await dispatchEvent(wiring, 'guildMemberAdd', joining.member);
+
+    expect(joining.send).toHaveBeenCalledTimes(1);
+    expect(joining.channelSend).not.toHaveBeenCalled();
+  });
+
+  it('opens the SAME link modal on accept, so there is still only one way to store a Riot ID', async () => {
+    stubProvider();
+    const wiring = await buildWiring();
+    const accept = button(PROMPT_BUTTONS.accept);
+
+    await dispatch(wiring, accept.interaction);
+
+    expect(getPromptDecision(USER_ID)).toBe('accepted');
+    expect(accept.showModal).toHaveBeenCalledTimes(1);
+    const modal = accept.showModal.mock.calls[0]?.[0] as {
+      custom_id: string;
+      components: ReadonlyArray<{ components: ReadonlyArray<{ custom_id?: string }> }>;
+    };
+    expect(modal.custom_id).toBe(LINK_MODAL_ID);
+    // The identical field id the `/menu` path submits, which is what makes `handleModalSubmit` — and
+    // therefore the store's consent rule — the single write path for a Riot ID.
+    expect(modal.components[0]?.components[0]?.custom_id).toBe(RIOT_ID_FIELD);
+  });
+
+  it('records a decline, replaces the prompt with one line, and drops the buttons', async () => {
+    stubProvider();
+    const wiring = await buildWiring();
+    const decline = button(PROMPT_BUTTONS.decline);
+
+    await dispatch(wiring, decline.interaction);
+
+    expect(getPromptDecision(USER_ID)).toBe('declined');
+    // `update`, not `reply`: the buttons are removed in place, so a message that outlived its own
+    // question cannot be answered again.
+    expect(decline.update).toHaveBeenCalledTimes(1);
+    const payload = decline.update.mock.calls[0]?.[0] as { content?: string; components?: readonly unknown[] };
+    expect(payload.components).toEqual([]);
+    expect(payload.content).toMatch(/not ask again/i);
+    // And no modal: declining is an answer, not the start of another flow.
+    expect(decline.showModal).not.toHaveBeenCalled();
+  });
+
+  it('stores the Riot ID through the modal a member accepted, with consent captured in order', async () => {
+    stubProviderWithRank();
+    const wiring = await buildWiring();
+    const guild = fakeGuild({
+      roles: [{ id: 'role-gold1', name: 'Gold 1', color: 0, position: 1 }],
+      memberRoleIds: [],
+    });
+    const accept = button(PROMPT_BUTTONS.accept);
+    await dispatch(wiring, accept.interaction);
+
+    // The member types their Riot ID into the modal the prompt opened. Same modal, same handler,
+    // same store path as `/menu` — which is why no second consent rule had to be written.
+    const submit = modalSubmit(LINK_MODAL_ID, 'Dipplox#LPARG', guild.guild);
+    await dispatch(wiring, submit.interaction);
+
+    expect(getLinkedAccount(USER_ID)).toMatchObject({ name: 'Dipplox', tag: 'LPARG' });
+    expect(guild.added).toEqual(['role-gold1']);
+  });
+
+  it('ignores a second, contradictory answer on a button that outlived its question', async () => {
+    stubProvider();
+    const wiring = await buildWiring();
+    await dispatch(wiring, button(PROMPT_BUTTONS.decline).interaction);
+
+    // An open inbox can hold a button after the question is answered. A stale press must not rewrite
+    // the answer on file — otherwise a later accidental click can un-decline somebody.
+    await dispatch(wiring, button(PROMPT_BUTTONS.accept).interaction);
+
+    expect(getPromptDecision(USER_ID)).toBe('declined');
+  });
 });
 
 /* -------------------------------------------------------------------------------------------- */

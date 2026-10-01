@@ -9,18 +9,24 @@ import { RANK_CACHE_TTL_MS, type RankSnapshot } from './provider.js';
 import {
   cacheRank,
   getCachedRank,
+  getPromptDecision,
   isLinked,
   getLinkedAccount,
   isRankCacheFresh,
   linkAccount,
   linkedAccountCount,
+  listLinkedAccounts,
+  recordPromptDecision,
   resetLinkedAccounts,
+  resetPromptDecisions,
   unlinkAccount,
+  type LinkedAccount,
 } from './store.js';
 import { findTierByName } from './tiers.js';
 
 const USER = '111111111111111111';
 const OTHER_USER = '222222222222222222';
+const THIRD_USER = '333333333333333333';
 const NOW = 1_700_000_000_000;
 
 /**
@@ -47,8 +53,14 @@ function snapshot(tierName = 'ASCENDANT 2'): RankSnapshot {
   };
 }
 
+/** Sort key for comparing whole lists, so an ordering assertion is not an ordering accident. */
+function byUserId(left: LinkedAccount | null, right: LinkedAccount | null): number {
+  return (left?.userId ?? '').localeCompare(right?.userId ?? '');
+}
+
 beforeEach(() => {
   resetLinkedAccounts();
+  resetPromptDecisions();
 });
 
 describe('the link store', () => {
@@ -185,6 +197,147 @@ describe('the rank cache', () => {
 });
 
 /* -------------------------------------------------------------------------------------------- */
+/* Listing every link                                                                              */
+/* -------------------------------------------------------------------------------------------- */
+
+describe('listLinkedAccounts', () => {
+  it('starts empty, so a scheduler with nobody linked has nothing to do', () => {
+    expect(listLinkedAccounts()).toEqual([]);
+  });
+
+  it('returns every linked account, with the same shape the single-row read produces', () => {
+    linkAccount(USER, { name: 'Dipplox', tag: 'LPARG' }, NOW);
+    linkAccount(OTHER_USER, { name: 'Someone', tag: 'EU1' }, NOW + 1);
+
+    // Deep equality rather than identity: the rows come out of SQLite and are rebuilt from columns,
+    // so two reads are never the same object. A scheduler that compared them by identity would treat
+    // a fresh read as a different account.
+    expect([...listLinkedAccounts()].sort(byUserId)).toEqual(
+      [getLinkedAccount(USER), getLinkedAccount(OTHER_USER)].sort(byUserId),
+    );
+  });
+
+  it('orders by user id, so two reads of the same database agree on the order', () => {
+    // The sync turns this list into a work queue. An unstable order would make "already handled in
+    // this pass" depend on the database's mood instead of on the account.
+    linkAccount(THIRD_USER, { name: 'Third', tag: 'NA1' }, NOW);
+    linkAccount(USER, { name: 'First', tag: 'EU1' }, NOW);
+    linkAccount(OTHER_USER, { name: 'Second', tag: 'NA1' }, NOW);
+
+    expect(listLinkedAccounts().map((account) => account.userId)).toEqual([USER, OTHER_USER, THIRD_USER]);
+    expect(listLinkedAccounts().map((account) => account.userId)).toEqual([
+      USER,
+      OTHER_USER,
+      THIRD_USER,
+    ]);
+  });
+
+  it('leaves out rows that hold a rank but no link', () => {
+    // The rank columns are independently nullable, so this row is possible and legitimate. It must
+    // not appear here: the scheduler would have no Riot ID to look up.
+    cacheRank(USER, snapshot(), NOW);
+
+    expect(listLinkedAccounts()).toEqual([]);
+    expect(linkedAccountCount()).toBe(0);
+  });
+
+  it('forgets a link the moment it is unlinked', () => {
+    linkAccount(USER, { name: 'Dipplox', tag: 'LPARG' }, NOW);
+    linkAccount(OTHER_USER, { name: 'Someone', tag: 'EU1' }, NOW);
+
+    unlinkAccount(USER);
+
+    expect(listLinkedAccounts().map((account) => account.userId)).toEqual([OTHER_USER]);
+  });
+
+  it('agrees with linkedAccountCount, which is what the boot log reports', () => {
+    linkAccount(USER, { name: 'Dipplox', tag: 'LPARG' }, NOW);
+    linkAccount(OTHER_USER, { name: 'Someone', tag: 'EU1' }, NOW);
+    cacheRank(THIRD_USER, snapshot(), NOW);
+
+    // Two ways of counting the same thing, and an operator confirming the boot log deserves to have
+    // the second one agree with the list the scheduler will walk.
+    expect(listLinkedAccounts()).toHaveLength(linkedAccountCount());
+  });
+});
+
+/* -------------------------------------------------------------------------------------------- */
+/* The join prompt decision                                                                        */
+/* -------------------------------------------------------------------------------------------- */
+
+describe('the prompt decision', () => {
+  it('reads as "never asked" for a member who has no row at all', () => {
+    // Distinct from a refusal, and the distinction is the whole point: `null` is the only state in
+    // which the join prompt may fire.
+    expect(getPromptDecision(USER)).toBeNull();
+  });
+
+  it('round-trips both answers', () => {
+    expect(recordPromptDecision(USER, 'accepted', NOW)).toBe('accepted');
+    expect(getPromptDecision(USER)).toBe('accepted');
+
+    expect(recordPromptDecision(OTHER_USER, 'declined', NOW)).toBe('declined');
+    expect(getPromptDecision(OTHER_USER)).toBe('declined');
+  });
+
+  it('keeps each member their own answer', () => {
+    recordPromptDecision(USER, 'accepted', NOW);
+    recordPromptDecision(OTHER_USER, 'declined', NOW);
+
+    expect(getPromptDecision(USER)).toBe('accepted');
+    expect(getPromptDecision(OTHER_USER)).toBe('declined');
+  });
+
+  it('lets a second answer replace the first, because a real correction has to win', () => {
+    recordPromptDecision(USER, 'declined', NOW);
+    recordPromptDecision(USER, 'accepted', NOW + 1_000);
+
+    expect(getPromptDecision(USER)).toBe('accepted');
+  });
+
+  it('stores a decline for a member who has no link, which is the whole point of the table', () => {
+    recordPromptDecision(USER, 'declined', NOW);
+
+    expect(getPromptDecision(USER)).toBe('declined');
+    expect(getLinkedAccount(USER)).toBeNull();
+    expect(isLinked(USER)).toBe(false);
+    expect(listLinkedAccounts()).toEqual([]);
+  });
+
+  it('survives an unlink, because unlinking is not consent to be asked again', () => {
+    // `unlinkAccount` deletes a whole `valorant_links` row. A decision kept in that row would be
+    // deleted with it, and the member would be asked a question they had already answered.
+    linkAccount(USER, { name: 'Dipplox', tag: 'LPARG' }, NOW);
+    recordPromptDecision(USER, 'declined', NOW);
+
+    unlinkAccount(USER);
+
+    expect(getLinkedAccount(USER)).toBeNull();
+    expect(getPromptDecision(USER)).toBe('declined');
+  });
+
+  it('survives the link being replaced, because a relink does not change the answer', () => {
+    linkAccount(USER, { name: 'Wrong', tag: 'EU1' }, NOW);
+    recordPromptDecision(USER, 'accepted', NOW);
+
+    linkAccount(USER, { name: 'Dipplox', tag: 'LPARG' }, NOW + 1_000);
+
+    expect(getPromptDecision(USER)).toBe('accepted');
+  });
+
+  it('is cleared by its own reset and not by the link reset, so the two never confuse a test', () => {
+    linkAccount(USER, { name: 'Dipplox', tag: 'LPARG' }, NOW);
+    recordPromptDecision(USER, 'declined', NOW);
+
+    resetLinkedAccounts();
+    expect(getPromptDecision(USER)).toBe('declined');
+
+    resetPromptDecisions();
+    expect(getPromptDecision(USER)).toBeNull();
+  });
+});
+
+/* -------------------------------------------------------------------------------------------- */
 /* Persistence                                                                                    */
 /* -------------------------------------------------------------------------------------------- */
 
@@ -291,6 +444,33 @@ describe('surviving a restart', () => {
       expect(getLinkedAccount(USER)).toBeNull();
       expect(getCachedRank(USER)).toBeNull();
       expect(unlinkAccount(USER)).toBe(false);
+    });
+  });
+
+  it('still knows the member already answered, so a restart cannot re-ask the question', () => {
+    // The promise the prompt makes is "exactly once", and a bot that forgets on boot would break it
+    // on every deploy. This is the restart path that promise has to survive.
+    acrossRestart((phase) => {
+      if (phase === 'before') {
+        expect(getPromptDecision(USER)).toBeNull();
+        recordPromptDecision(USER, 'declined', NOW);
+        return;
+      }
+      expect(getPromptDecision(USER)).toBe('declined');
+    });
+  });
+
+  it('still lists every linked account after the process handle is closed and reopened', () => {
+    // The scheduler's whole work queue comes from this. A process-wide handle that answered from a
+    // stale cache would leave every member unrefreshed after a deploy, silently.
+    acrossRestart((phase) => {
+      if (phase === 'before') {
+        linkAccount(USER, { name: 'Dipplox', tag: 'LPARG' }, NOW);
+        linkAccount(OTHER_USER, { name: 'Someone', tag: 'EU1' }, NOW);
+        return;
+      }
+      expect(listLinkedAccounts().map((account) => account.userId)).toEqual([USER, OTHER_USER]);
+      expect(linkedAccountCount()).toBe(2);
     });
   });
 });

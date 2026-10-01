@@ -1,0 +1,79 @@
+name: Renewal reminder
+
+# HeavenCloud's free tier requires a manual renewal every 7 days; a server that is not renewed
+# suspends and is then deleted. This job exists so nobody has to remember.
+#
+# Why a GitHub issue and not a Discord webhook: the reminder must survive the thing it is reminding
+# about. A webhook hosted in the free instance dies the moment that instance is suspended, which is
+# exactly when the reminder matters most. GitHub is independent of the host and of any local machine.
+
+on:
+  schedule:
+    # 10:00 UTC daily. The job decides internally whether a reminder is due, so the cron frequency is
+    # only how often the decision runs and does not determine how often people are pinged.
+    - cron: '0 10 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  remind:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check and create the renewal reminder
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const LABEL = 'renewal-due';
+            const PANEL = 'https://control.heavencloud.in';
+
+            // A single open issue is the whole state machine. If it is already open, someone has not
+            // renewed yet, so re-pinging daily would be noise. When they renew they close it, and the
+            // next run opens a fresh one. Nothing else needs to be stored or remembered.
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: LABEL,
+              state: 'open',
+            });
+
+            if (existing.data.length > 0) {
+              const issue = existing.data[0];
+              core.info(`Reminder already open: #${issue.number}`);
+              core.info('Nothing to do. Close the issue once the free instance is renewed.');
+              return;
+            }
+
+            const body = [
+              '## Your free bot instance needs renewing',
+              '',
+              `HeavenCloud free servers suspend **7 days** after creation and are **deleted 2 days**
+after that if the renewal is missed. This reminder opens once and stays open until you renew.`,
+              '',
+              '### Do this',
+              '',
+              `1. Open the panel: ${PANEL}`,
+              '2. Find the server and click **Renew**.',
+              '3. Come back and **close this issue**. The next reminder opens on its own.',
+              '',
+              '### Why it is here and not in Discord',
+              '',
+              'If the reminder lived in the free server, it would die with the free server, exactly when',
+              'you most need to be told. This one does not depend on the bot, on the host, or on any',
+              'computer being switched on.',
+              '',
+              '---',
+              '_Automatic reminder. Closing it is the acknowledgement; there is nothing else to configure._',
+            ].join('\n');
+
+            const created = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: 'Renew the free bot instance (HeavenCloud, every 7 days)',
+              body,
+              labels: [LABEL],
+            });
+
+            core.info(`Created reminder #${created.data.number}`);

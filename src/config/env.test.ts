@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { formatEnvIssues, validateEnv, validateInstallLinkEnv } from './env.js';
+import { DEFAULT_RANK_SYNC_INTERVAL_MINUTES, formatEnvIssues, validateEnv, validateInstallLinkEnv } from './env.js';
 
 const VALID_ENV = {
   DISCORD_TOKEN: 'token-value',
@@ -32,6 +32,7 @@ describe('validateEnv', () => {
       logLevel: 'info',
       enablePrivilegedIntents: false,
       henrikDevApiKey: null,
+      rankSyncIntervalMinutes: DEFAULT_RANK_SYNC_INTERVAL_MINUTES,
     });
   });
 
@@ -131,6 +132,65 @@ describe('the optional rank provider key', () => {
     expect(issues[0]?.variable).toBe('HENRIK_DEV_API_KEY');
     expect(issues[0]?.problem).toMatch(/delete the line/);
     expect(issues[0]?.hint).toContain('henrikdev.xyz');
+  });
+});
+
+/* -------------------------------------------------------------------------------------------- */
+/* The automatic rank sync interval                                                                */
+/* -------------------------------------------------------------------------------------------- */
+
+describe('RANK_SYNC_INTERVAL_MINUTES', () => {
+  it('defaults to twelve hours, so an unconfigured bot still keeps ranks current', () => {
+    // The default has to be a working value, not a "disabled" sentinel: this is a feature the plan
+    // asked for and a bot that silently never refreshed ranks would be the bug, not the default.
+    expect(DEFAULT_RANK_SYNC_INTERVAL_MINUTES).toBe(720);
+    expect(configOf(VALID_ENV).rankSyncIntervalMinutes).toBe(720);
+  });
+
+  it('keeps a valid whole number of minutes', () => {
+    expect(configOf({ ...VALID_ENV, RANK_SYNC_INTERVAL_MINUTES: '30' }).rankSyncIntervalMinutes).toBe(30);
+    expect(configOf({ ...VALID_ENV, RANK_SYNC_INTERVAL_MINUTES: '1440' }).rankSyncIntervalMinutes).toBe(1440);
+  });
+
+  it('trims whitespace, so a pasted value is not read as a syntax error', () => {
+    expect(configOf({ ...VALID_ENV, RANK_SYNC_INTERVAL_MINUTES: '  60  ' }).rankSyncIntervalMinutes).toBe(60);
+  });
+
+  it('rejects zero, because an interval of zero would spin the scheduler', () => {
+    // Not defaulted to something sensible either. A zero here means the operator thought they were
+    // switching something off, and quietly refreshing on a timer instead is the opposite.
+    const issues = issuesOf({ ...VALID_ENV, RANK_SYNC_INTERVAL_MINUTES: '0' });
+    expect(issues[0]?.variable).toBe('RANK_SYNC_INTERVAL_MINUTES');
+    expect(issues[0]?.problem).toBe('must be a positive whole number of minutes');
+  });
+
+  it('rejects a negative interval, which would make every account due forever', () => {
+    const issues = issuesOf({ ...VALID_ENV, RANK_SYNC_INTERVAL_MINUTES: '-5' });
+    expect(issues[0]?.variable).toBe('RANK_SYNC_INTERVAL_MINUTES');
+    expect(issues[0]?.problem).toBe('must be a positive whole number of minutes');
+  });
+
+  it('rejects a non-numeric value with a message that names the variable, not NaN', () => {
+    const issues = issuesOf({ ...VALID_ENV, RANK_SYNC_INTERVAL_MINUTES: 'twelve' });
+    expect(issues[0]?.variable).toBe('RANK_SYNC_INTERVAL_MINUTES');
+    expect(issues[0]?.problem).toBe('must be a positive whole number of minutes');
+    expect(issues[0]?.hint).toContain('Default: 720');
+  });
+
+  it('rejects a fractional value rather than rounding it silently', () => {
+    // 12.5 minutes has no meaning here, and rounding it would leave the operator believing they
+    // configured something other than what the bot runs.
+    expect(issuesOf({ ...VALID_ENV, RANK_SYNC_INTERVAL_MINUTES: '12.5' })[0]?.variable).toBe(
+      'RANK_SYNC_INTERVAL_MINUTES',
+    );
+  });
+
+  it('reports a blank value instead of answering it with the default', () => {
+    // `RANK_SYNC_INTERVAL_MINUTES=` is a copy/paste that lost the number. Defaulting it would hide
+    // the mistake behind a bot that looks correctly configured.
+    const issues = issuesOf({ ...VALID_ENV, RANK_SYNC_INTERVAL_MINUTES: '  ' });
+    expect(issues[0]?.variable).toBe('RANK_SYNC_INTERVAL_MINUTES');
+    expect(issues[0]?.problem).toBe('must be a positive whole number of minutes');
   });
 });
 

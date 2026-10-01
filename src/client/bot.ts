@@ -121,9 +121,12 @@ function reportPlan(
     );
   }
 
-  const blockedPrivileged = plan.missingIntents.flatMap((missing) => missing.intents).filter((intent) =>
-    PRIVILEGED_INTENTS.includes(intent),
-  );
+  // Deduplicated, because more than one feature may declare the same intent — `welcome` and `ranks`
+  // both need `GuildMembers` — and "GuildMembers, GuildMembers" in a boot warning reads like two
+  // separate problems to solve when there is only one toggle to tick.
+  const blockedPrivileged = [
+    ...new Set(plan.missingIntents.flatMap((missing) => missing.intents).filter((intent) => PRIVILEGED_INTENTS.includes(intent))),
+  ];
   if (blockedPrivileged.length > 0) {
     log.warn(
       { intents: describeIntents(blockedPrivileged) },

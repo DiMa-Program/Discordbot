@@ -29,7 +29,14 @@
  */
 
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -43,6 +50,43 @@ const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '
 loadDotenv({ path: path.join(projectRoot, '.env') });
 
 const stagingDir = path.join(projectRoot, 'dist-package', 'content');
+
+/** Where database copies land. Local only, gitignored, and the reason a wipe is survivable. */
+const backupDir = path.join(projectRoot, 'backups');
+
+/** How many database copies to keep. Old ones are pruned oldest-first. */
+const BACKUP_HISTORY = 15;
+
+/**
+ * Keeps the newest `BACKUP_HISTORY` copies and removes the rest.
+ *
+ * Named with a sortable ISO timestamp so "newest" is a string comparison rather than a stat call per
+ * file. `bot.db-wal` and `bot.db-shm` share a stamp with their `bot.db` and are pruned together, so a
+ * retained set is never half a WAL pair.
+ */
+function pruneBackups() {
+  if (!existsSync(backupDir)) {
+    return;
+  }
+
+  const stamps = new Map();
+
+  for (const file of readdirSync(backupDir)) {
+    const match = /^bot-(.+?)(\.db(-wal|-shm)?)$/.exec(file);
+    if (match !== null) {
+      const stamp = match[1];
+      stamps.set(stamp, [...(stamps.get(stamp) ?? []), file]);
+    }
+  }
+
+  const ordered = [...stamps.keys()].sort().reverse();
+
+  for (const stamp of ordered.slice(BACKUP_HISTORY)) {
+    for (const file of stamps.get(stamp) ?? []) {
+      rmSync(path.join(backupDir, file), { force: true });
+    }
+  }
+}
 
 /**
  * The hosting node's SSH host key, pinned so a substituted host cannot receive the SFTP password.
@@ -149,7 +193,89 @@ try {
   }
 
   // -------------------------------------------------------------------------------------------
-  // 3. Stage the exact committed tree
+  // 3. Back up the live database
+  // -------------------------------------------------------------------------------------------
+  //
+  // WHY THIS IS NOT OPTIONAL
+  //
+  // HeavenCloud's own documentation states "free instances can wipe", and a server that is not
+  // renewed is deleted two days after it suspends. The database holds every member's linked Riot ID,
+  // which is the one thing on that host that cannot be regenerated from the repository. Backing it up
+  // before touching the host means a wipe, a wipe-recreate, or a bot pointed at the wrong directory all
+  // cost a restore instead of the data.
+  //
+  // It runs BEFORE the upload, so a deploy that fails part-way still leaves a copy of what was there
+  // beforehand. The three SQLite files are fetched together because the database runs in WAL mode:
+  // `bot.db` alone can be missing commits that are still only in `bot.db-wal`.
+  //
+  // A backup failure warns and continues. Blocking a deploy on a backup would be worse than the
+  // problem it protects against, since the deploy itself does not touch `data/`.
+
+  const backupStaging = path.join(projectRoot, 'dist-package', 'backup-download');
+
+  try {
+    rmSync(backupStaging, { recursive: true, force: true });
+    mkdirSync(backupStaging, { recursive: true });
+
+    const backupIni = path.join(tmpdir(), `winscp-backup-${process.pid}.ini`);
+    const backupScript = path.join(tmpdir(), `winscp-backup-${process.pid}.txt`);
+
+    writeFileSync(
+      backupIni,
+      `[Configuration]\r\n[Session\\backup]\r\nHostName=${host}\r\nPortNumber=${port}\r\n` +
+        `UserName=${user}\r\nProtocol=SFTP\r\nPuttyProtocol=putty-sftp\r\nTimeout=30\r\n`,
+      { encoding: 'utf8' },
+    );
+
+    const backupUrl = `sftp://${encodeURIComponent(user)}:${encodeURIComponent(password)}@${host}:${port}/`;
+    writeFileSync(
+      backupScript,
+      [
+        `open ${backupUrl} -hostkey="${hostKey}"`,
+        `option batch on`,
+        `option confirm off`,
+        `cd /home/container`,
+        `get -filemask="bot.db*" data/ ${backupStaging.replace(/\\/g, '/')}`,
+        `exit`,
+      ].join('\r\n') + '\r\n',
+      { encoding: 'utf8' },
+    );
+
+    const downloaded = spawnSync(winscp, ['/ini=' + backupIni, '/script=' + backupScript], {
+      encoding: 'utf8',
+      windowsHide: true,
+    });
+
+    rmSync(backupIni, { force: true });
+    rmSync(backupScript, { force: true });
+
+    const fetched = existsSync(backupStaging) ? readdirSync(backupStaging) : [];
+
+    if (fetched.length === 0) {
+      console.log('[deploy] no database on the host yet, nothing to back up.');
+    } else {
+      mkdirSync(backupDir, { recursive: true });
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      const saved = [];
+
+      for (const file of fetched) {
+        const target = path.join(backupDir, file.replace(/\.(db-wal|db-shm)$/, '$1') .replace(/^bot\.db/, `bot-${stamp}.db`));
+        copyFileSync(path.join(backupStaging, file), target);
+        saved.push(path.basename(target));
+      }
+
+      pruneBackups();
+      console.log(`[deploy] database backed up to backups/ (${saved.join(', ')}).`);
+    }
+  } catch (error) {
+    console.log(`[deploy] WARNING: could not back up the database. Continuing.`);
+    console.log(`[deploy]   ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    rmSync(backupStaging, { recursive: true, force: true });
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // 4. Stage the exact committed tree
   // -------------------------------------------------------------------------------------------
 
   rmSync(path.dirname(stagingDir), { recursive: true, force: true });
@@ -160,7 +286,7 @@ try {
   execFileSync('git', ['worktree', 'add', '--detach', '--force', stagingDir, 'HEAD'], { cwd: projectRoot });
 
   // -------------------------------------------------------------------------------------------
-  // 4. Upload over SFTP
+  // 5. Upload over SFTP
   // -------------------------------------------------------------------------------------------
   //
   // Two things about WinSCP's CLI took real work to get right, and both are load-bearing:

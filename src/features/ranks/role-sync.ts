@@ -262,6 +262,66 @@ export function hasManageRoles(permissions: { has(bit: bigint): boolean } | null
   return permissions?.has(PermissionFlagsBits.ManageRoles) === true;
 }
 
+/** What happened to one member's rank roles. Every value maps to an existing remediation. */
+export type RankRoleOutcome = 'applied' | 'unchanged' | 'member-unreadable' | 'blocked';
+
+/** The result of syncing one member, in a form both callers and logs can read. */
+export interface MemberRoleSyncResult {
+  readonly outcome: RankRoleOutcome;
+  /** Set when the sync could not be carried out. Never set for `applied` or `unchanged`. */
+  readonly blockedBy: RoleSyncBlocker | null;
+  /** True when the guild really does hold a rank role for this member's tier after the sync. */
+  readonly applied: boolean;
+}
+
+/**
+ * Reads a member's roles, plans the change and executes it. One member, one tier.
+ *
+ * THE ONE COMPOSITION OF PLANNER AND EXECUTOR, so there is a single implementation of "keep exactly
+ * one rank role on this member". The `/menu` refresh path and the automatic pass both need exactly
+ * this sequence — read what is held, plan, apply — and both need the same refusal for the same
+ * reason: granting without knowing what the member already holds would leave two rank roles and
+ * Discord renders the higher one, which is the silent wrong-rank this module exists to prevent.
+ *
+ * The three refusals are distinguishable on purpose, because they are different user-facing facts:
+ * a member who could not be read should be asked to try again, while a blocked hierarchy needs an
+ * admin to move a role and no amount of retrying will help.
+ */
+export async function syncMemberRankRole(
+  gateway: RankRoleGateway,
+  tier: RankTier | null,
+  memberId: string,
+): Promise<MemberRoleSyncResult> {
+  let held: readonly string[];
+  try {
+    held = await gateway.getMemberRoleIds(memberId);
+  } catch {
+    // A member who left the server, or a cache miss on a role read, must NOT be treated as holding
+    // nothing: doing so would make this function grant the new role without removing the old one.
+    // `null` is a refusal, not an empty list.
+    return { outcome: 'member-unreadable', blockedBy: null, applied: false };
+  }
+
+  const plan = planRoleAssignment({
+    tiers: RANKS,
+    guildRoles: await gateway.listRankRoles(),
+    memberRoleIds: held,
+    tier,
+    canManageRoles: gateway.canManageRoles,
+    botTopPosition: gateway.botTopPosition,
+  });
+
+  const result = await applyRoleAssignment(gateway, plan, memberId);
+  if (result.blockedBy !== null) {
+    return { outcome: 'blocked', blockedBy: result.blockedBy, applied: false };
+  }
+  return {
+    outcome: result.assignedRoleId === null ? 'unchanged' : 'applied',
+    blockedBy: null,
+    applied: result.assignedRoleId !== null,
+  };
+}
+
 function toRankRole(role: Role): RankRole {
   return { id: role.id, name: role.name, color: role.color, position: role.position };
 }

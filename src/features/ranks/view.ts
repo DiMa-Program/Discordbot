@@ -18,7 +18,16 @@
  * command config cannot bypass the check.
  */
 
-import { ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, MessageFlags } from 'discord.js';
+import {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  EmbedBuilder,
+  MessageFlags,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+} from 'discord.js';
 
 import { NOT_CONFIGURED_MESSAGE } from './messages.js';
 import type { RankSnapshot } from './provider.js';
@@ -35,6 +44,94 @@ export const MENU_BUTTONS = {
 /** The modal the link button opens, and the one field inside it. */
 export const LINK_MODAL_ID = 'rank:link-modal';
 export const RIOT_ID_FIELD = 'riot-id';
+
+/**
+ * The two buttons of the one-time join prompt.
+ *
+ * Namespaced exactly like `MENU_BUTTONS` because these custom ids arrive on the SAME
+ * `interactionCreate` listener as the menu's. A prompt id that read `rank:link` would be
+ * indistinguishable from the menu's own link button, and one press would open a modal the member
+ * never asked for.
+ */
+export const PROMPT_BUTTONS = {
+  accept: 'rank:prompt-accept',
+  decline: 'rank:prompt-decline',
+} as const;
+
+/**
+ * What the prompt becomes once it has been answered.
+ *
+ * Replace the content AND drop the components: a message whose buttons still answer would let the
+ * member press "No thanks" five times and get a reply each time, which is exactly the
+ * "asked more than once" experience the stored decision exists to prevent.
+ */
+export const PROMPT_DECLINE_TEXT =
+  'No problem — I will not ask again. You can still link your Riot ID any time with `/menu`.';
+
+/** One button row. Discord permits at most five, and two is all this needs. */
+function promptRow(): ActionRowBuilder<ButtonBuilder> {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setStyle(ButtonStyle.Primary).setCustomId(PROMPT_BUTTONS.accept).setLabel('Yes, link mine'),
+    new ButtonBuilder().setStyle(ButtonStyle.Secondary).setCustomId(PROMPT_BUTTONS.decline).setLabel('No thanks'),
+  );
+}
+
+/**
+ * The one-time join prompt, as a direct message.
+ *
+ * A direct message and not a channel post, because the question is consent: asking in public would
+ * put somebody's answer in front of the whole server, and the provider's terms only allow a lookup
+ * for a member who agreed privately. The failure mode is documented at the call site in
+ * `prompt.ts` — a member with direct messages closed is asked again on their next join, never
+ * marked as declined.
+ */
+export function buildPromptView(): {
+  readonly embeds: readonly EmbedBuilder[];
+  readonly components: readonly ActionRowBuilder<ButtonBuilder>[];
+} {
+  const embed = new EmbedBuilder()
+    .setColor(ACCENT)
+    .setTitle('VALORANT rank roles')
+    .setDescription(
+      'Want your competitive rank as a role on this server? Link your Riot ID once and the bot keeps ' +
+        'the role in step with your rank, on its own, without you running anything.',
+    )
+    .setFooter({
+      text:
+        'Your Riot ID is only read after you link it, and only for that account. Unlink any time from /menu.',
+    });
+
+  return { embeds: [ embed ], components: [ promptRow() ] };
+}
+
+/**
+ * The linking modal, built in the view layer and reused by every path that opens it.
+ *
+ * ONE BUILDER, TWO ENTRY POINTS. `/menu`, the refresh flow and the join prompt all open the SAME
+ * modal, so `interaction.ts` has exactly one modal submit handler and there is no second way for a
+ * Riot ID to enter the store. Building a second modal for the prompt would have meant two custom ids,
+ * two submit handlers and two places to keep the consent rule honest.
+ */
+export function buildLinkModal() {
+  return new ModalBuilder()
+    .setCustomId(LINK_MODAL_ID)
+    .setTitle('Link your VALORANT account')
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId(RIOT_ID_FIELD)
+          .setLabel('Riot ID')
+          .setPlaceholder('SomePlayer#EU1')
+          .setStyle(TextInputStyle.Short)
+          // The ONLY input in the modal: Discord accepts no other component type inside one, which
+          // is why the region is inferred from the tag instead of asked for.
+          .setRequired(true)
+          .setMinLength(5)
+          .setMaxLength(40),
+      ),
+    )
+    .toJSON();
+}
 
 const ACCENT = 0x6ae2af;
 const MUTED = 0x868986;
