@@ -56,9 +56,18 @@ if (!git(['rev-parse', '--verify', 'origin/main'], 'utf8')) {
   console.log('[package] note: no origin/main found locally. Push the branch if you want a backup.');
 }
 
-const ahead = Number(git(['rev-list', '--count', `origin/${branch}..${branch}`]).trim() || '0');
-if (Number.isFinite(ahead) && ahead > 0) {
-  console.log(`[package] note: ${ahead} commit(s) on ${branch} are not pushed to origin yet.`);
+// The unpushed-commit count is advisory, so a missing remote branch must not stop the build. A brand
+// new branch has no origin/<branch> ref at all, and `git rev-list` treats that as a fatal ambiguous
+// argument rather than an empty result.
+const remoteRef = `origin/${branch}`;
+const hasRemote = existsSync(path.join(projectRoot, '.git', 'refs', 'remotes', 'origin', branch));
+if (!hasRemote) {
+  console.log(`[package] note: ${branch} has no ${remoteRef}; push it if you want a remote backup.`);
+} else {
+  const unpushed = git(['rev-list', '--count', `${remoteRef}..${branch}`]).trim();
+  if (unpushed !== '0' && unpushed !== '') {
+    console.log(`[package] note: ${unpushed} commit(s) on ${branch} are not pushed to origin yet.`);
+  }
 }
 
 rmSync(outputDir, { recursive: true, force: true });
