@@ -392,6 +392,10 @@ try {
     `open ${uploadUrl} -hostkey="${hostKey}"`,
     'option batch on',
     'option confirm off',
+    // `option batch abort` is what makes WinSCP skip, rather than abort on, a `rm` whose target is
+    // already absent. A first deploy has no `dist/` on the host at all, and an abort there would
+    // stop the script before the remaining removals.
+    'option batch abort',
     `rm ${remoteDir}/dist/features`,
     `rm ${remoteDir}/dist/config`,
     `rm ${remoteDir}/dist/core`,
