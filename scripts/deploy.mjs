@@ -216,7 +216,9 @@ try {
   //
   // The local side is absolute rather than relative to the process working directory, so the transfer
   // cannot silently pick up the project root instead of the staging checkout.
-  const localSpec = `${stagingDir.replace(/\\/g, '/')}/*`;
+  // Backslashes, not forward slashes. A forward-slash form was tried and WinSCP resolved it to
+  // `C:\.env.example`, having split the path on the first separator.
+  const localSpec = `${stagingDir}\\*`;
 
   const script = [
     `open ${uploadUrl} -hostkey="${hostKey}"`,
