@@ -1,4 +1,4 @@
-/**
+﻿/**
  * One-command deploy: upload the committed code to the Pterodactyl host and restart the bot.
  *
  * WHY THIS EXISTS
@@ -31,6 +31,7 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import {
   copyFileSync,
+  cpSync,
   existsSync,
   mkdirSync,
   readdirSync,
@@ -138,7 +139,6 @@ function fail(message) {
 let winscp = null;
 let iniPath = null;
 let scriptPath = null;
-let staleScriptPath = null;
 
 try {
   const dirty = git(['status', '--porcelain']).trim();
@@ -195,7 +195,7 @@ try {
 
   // Declared here, before either SFTP step, because the backup needs it too. It used to be declared
   // inside the upload section, which made the backup step throw "Cannot access 'hostKey' before
-  // initialization" — a Temporal Dead Zone error caught by the backup's own try/catch, so the backup
+  // initialization" â€” a Temporal Dead Zone error caught by the backup's own try/catch, so the backup
   // silently degraded to a warning on every single deploy.
   const hostKey = process.env['HEAVEN_SFTP_HOST_KEY'] ?? DEFAULT_SSH_HOST_KEY;
 
@@ -311,6 +311,46 @@ try {
   execFileSync('git', ['worktree', 'add', '--detach', '--force', stagingDir, 'HEAD'], { cwd: projectRoot });
 
   // -------------------------------------------------------------------------------------------
+  // 4b. Compile here, not on the host
+  // -------------------------------------------------------------------------------------------
+  //
+  // WHY THE BUILD CANNOT HAPPEN ON THE HOST
+  //
+  // The container has a Node runtime and nothing else. There is no `npm` on the PATH, no `tsc`, and
+  // no `node_modules`, because the image ships no dev dependencies and the deploy uploads none.
+  // Asking the host to compile therefore cannot succeed, no matter how the build is triggered.
+  //
+  // The previous design relied on `index.js` compiling on first boot. That worked exactly once, on
+  // the very first deploy, and never again: `index.js` only compiles when `dist/index.js` is absent,
+  // and every later deploy left `dist/` in place, so that branch was never taken again. The
+  // container restarted into the original build indefinitely. Source fixes were shipped and provably
+  // never executed, with no error anywhere to indicate it.
+  //
+  // Compiling locally and uploading the output removes the dependency on the host. The host becomes
+  // a runtime-only target, which is what it actually is, and the deployed artifact matches the
+  // committed source by construction instead of by hope.
+  //
+  // `npm ci` rather than `npm install` so the build uses the lockfile exactly.
+  console.log('[deploy] installing dependencies ...');
+  execFileSync('npm', ['ci'], { cwd: projectRoot, stdio: 'inherit', shell: true });
+
+  console.log('[deploy] compiling ...');
+  execFileSync('npm', ['run', 'build'], { cwd: projectRoot, stdio: 'inherit', shell: true });
+
+  // The worktree checkout has no `dist/`, so the freshly built output is copied into the tree that
+  // gets uploaded. Copying rather than building in place keeps the one rule intact: what is uploaded
+  // is a checkout of HEAD plus its compiled form, with no local edits mixed in.
+  const builtDist = path.join(projectRoot, 'dist');
+  if (!existsSync(path.join(builtDist, 'index.js'))) {
+    fail(
+      'The build finished but dist/index.js does not exist, so there is nothing to deploy.\n' +
+        '  Nothing was uploaded, and the host still runs the previous build.',
+    );
+  }
+
+  cpSync(builtDist, path.join(stagingDir, 'dist'), { recursive: true });
+
+  // -------------------------------------------------------------------------------------------
   // 5. Upload over SFTP
   // -------------------------------------------------------------------------------------------
   //
@@ -334,7 +374,6 @@ try {
 
   iniPath = path.join(tmpdir(), `winscp-deploy-${process.pid}.ini`);
   scriptPath = path.join(tmpdir(), `winscp-deploy-${process.pid}.txt`);
-  staleScriptPath = path.join(tmpdir(), `winscp-stale-${process.pid}.txt`);
 
   const ini = [
     `HostName=${host}`,
@@ -372,83 +411,25 @@ try {
   // directory that is not a repository.
   const localSpec = `${stagingDir}\\*`;
 
+  // `put` overwrites file by file, so the freshly compiled `dist/` replaces the previous build in
+  // place. The stale output is deliberately NOT deleted first: doing that left the container with
+  // no `dist/index.js` to boot, and since the host has no compiler it never came back. Overwriting
+  // is both safer and sufficient.
   const script = [
     `open ${uploadUrl} -hostkey="${hostKey}"`,
     `put -filemask="*;*/|.git" "${localSpec}" ${remoteDir}/`,
-    `exit`,
-  ].join('\r\n');
-
-  // -------------------------------------------------------------------------------------------
-  // 5b. Remove the stale compiled output so the host rebuilds
-  // -------------------------------------------------------------------------------------------
-  //
-  // WHY THIS IS REQUIRED
-  //
-  // `dist/` is gitignored, so the staged worktree never contains it and the upload never replaces
-  // it. Meanwhile `index.js` only compiles when `dist/index.js` is ABSENT. Together those two facts
-  // meant every deploy after the first shipped source code that was never executed: the container
-  // restarted into the build from whenever it was originally compiled, indefinitely. It looks like
-  // a successful deploy because the upload succeeds and the restart succeeds.
-  //
-  // The failure is silent and it is the worst kind, because the running code is plausible. A fix
-  // merged and pushed shows up as "nothing happens", which reads as a Discord or permissions problem
-  // rather than a packaging one.
-  //
-  // Removing the directory is what makes `index.js` take its build branch. It is safe to do here
-  // because it happens BEFORE the restart: the currently running process holds its modules in
-  // memory, and a delete of already-loaded files does not disturb it. If the build then fails on
-  // the host the bot stays down, but that is a build failure the operator has to see anyway, and a
-  // knowingly stale build is the worse outcome.
-  //
-  // `rm` is issued without `-r`, because WinSCP rejects that switch on this build, and a non-empty
-  // `dist/` cannot be removed that way. Removing the nested compiled files first is what actually
-  // works, and it was verified against the host.
-  const staleScript = [
-    `open ${uploadUrl} -hostkey="${hostKey}"`,
-    'option batch on',
-    'option confirm off',
-    // `continue` is the default and is what is wanted here: a `rm` whose target is already absent
-    // reports an error, and a first deploy has no `dist/` on the host at all. `abort` would stop the
-    // script at the first missing target and skip every removal after it.
-    'option batch continue',
-    `rm ${remoteDir}/dist/features`,
-    `rm ${remoteDir}/dist/config`,
-    `rm ${remoteDir}/dist/core`,
-    `rm ${remoteDir}/dist/client`,
-    `rm ${remoteDir}/dist/scripts`,
-    `rm ${remoteDir}/dist/index.js`,
-    `rm ${remoteDir}/dist/index.js.map`,
-    `rm ${remoteDir}/dist`,
-    `ls ${remoteDir}/dist`,
     'exit',
   ].join('\r\n');
 
-  writeFileSync(staleScriptPath, staleScript + '\r\n', { encoding: 'utf8' });
-
-  const staleRemoval = spawnSync(
-    winscp,
-    ['/ini=' + iniPath, '/script=' + staleScriptPath],
-    { encoding: 'utf8', windowsHide: true },
-  );
-
-  // WinSCP exits non-zero whenever ANY command in the script reported an error, including the
-  // `rm`s that succeeded before an absent target was reached. Trusting the exit code here reported
-  // a failure for a step that had in fact fully succeeded, which is how a working deploy ends up
-  // announcing itself as broken.
+  // No stale-build removal here, deliberately.
   //
-  // The authoritative signal is the trailing `ls`, run after every removal. If it lists any compiled
-  // file, the build is still there and the host would restart into stale code. If it cannot find the
-  // directory at all, the goal is met.
-  const staleOutput = (staleRemoval.stdout ?? '').split(password).join('<redacted>');
-  const buildStillPresent = /^index\.js(\.map)?\s/m.test(staleOutput);
-
-  if (buildStillPresent) {
-    console.log('[deploy] WARNING: the stale build is still on the host. Continuing.');
-    console.log('[deploy]   The container will restart into the previous build.');
-  } else {
-    console.log('[deploy] cleared the stale build; the host will compile on restart.');
-  }
-
+  // An earlier version deleted the remote `dist/` so that `index.js` would recompile on restart.
+  // That was wrong twice over. It left the container with no `dist/index.js` to boot, and the host
+  // has no `tsc`, so nothing ever replaced it: the bot could not start at all. The failure looked
+  // like a permissions or Discord problem because the deploy itself still reported success.
+  //
+  // The host never needed to compile. The compiled output is now built locally and uploaded, so the
+  // `put` overwrites the previous build file by file and there is nothing to clear.
   writeFileSync(scriptPath, script + '\r\n', { encoding: 'utf8' });
 
   console.log(`[deploy] ${branch} @ ${shortSha}`);
@@ -518,7 +499,6 @@ try {
   if (iniPath !== null) rmSync(iniPath, { force: true });
   // The script file carries the password, so it is the one artifact that must not survive the run.
   if (scriptPath !== null) rmSync(scriptPath, { force: true });
-  if (staleScriptPath !== null) rmSync(staleScriptPath, { force: true });
   try {
     execFileSync('git', ['worktree', 'remove', '--force', stagingDir], { cwd: projectRoot, stdio: 'ignore' });
   } catch {

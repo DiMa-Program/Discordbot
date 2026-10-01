@@ -6,16 +6,21 @@
  * place to put its build step. This file is that place.
  *
  * Behaviour:
- *   - If `dist/index.js` already exists, boot it immediately. Restarts are fast.
- *   - Otherwise run the TypeScript build once, then boot.
+ *   - Boot `dist/index.js`. Nothing else.
  *
- * This matters for hosts that wipe the container home on redeploy: the build simply runs again,
- * because there is no `dist/` left to reuse.
+ * This file deliberately does NOT build. An earlier version compiled here whenever `dist/` was
+ * absent, on the assumption that the host had a toolchain. It does not: there is no `npm` on the
+ * PATH, no `tsc`, and no `node_modules`. The build worked once, on a first deploy, and never again,
+ * because after that `dist/` always existed and the branch was skipped. Every deploy since shipped
+ * source code the container never executed, and reported success while doing it.
+ *
+ * `npm run deploy` now compiles locally and uploads `dist/`, so this host is a runtime-only target.
+ * A missing build is therefore a packaging failure worth naming, not something to paper over by
+ * trying and failing to compile.
  *
  * Running this locally is equivalent to `npm run build && npm start`.
  */
 
-import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -24,17 +29,11 @@ const projectRoot = path.dirname(fileURLToPath(import.meta.url));
 const compiledEntry = path.join(projectRoot, 'dist', 'index.js');
 
 if (!existsSync(compiledEntry)) {
-  console.log('[entrypoint] dist/index.js not found — running the TypeScript build first.');
-
-  // The command is a single fixed string with no interpolation, and `shell: true` is required on
-  // Windows where npm is `npm.cmd` rather than an executable file. Passing an args array alongside
-  // `shell: true` triggers DEP0190, so the whole command is one string instead.
-  execFileSync('npm run build', { cwd: projectRoot, stdio: 'inherit', shell: true });
-
-  if (!existsSync(compiledEntry)) {
-    // Failing here beats booting a half-built tree and surfacing a confusing module-not-found later.
-    throw new Error('[entrypoint] the build finished but dist/index.js still does not exist.');
-  }
+  // Failing here beats booting a half-built tree and surfacing a confusing module-not-found later.
+  throw new Error(
+    '[entrypoint] dist/index.js is missing. Run `npm run deploy`, which compiles before uploading.\n' +
+      '  This host does not compile; the build is produced on the machine running the deploy.',
+  );
 }
 
 await import('./dist/index.js');
