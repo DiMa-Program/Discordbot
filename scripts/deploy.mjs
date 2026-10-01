@@ -206,8 +206,9 @@ try {
   const uploadUrl = `sftp://${encodeURIComponent(user)}:${encodeURIComponent(password)}@${host}:${port}/`;
 
   // `-filemask="*;*/"` is what makes this recurse: `*` matches files and `*/` matches directories,
-  // so a plain `put *` would upload the top level and skip everything nested under src/. WinSCP has no
-  // `-recursive` switch on `put`, and passing one aborts with "unknown option".
+  // so a plain `put *` would upload the top level and skip everything nested under src/. WinSCP's put
+  // has no `-recursive` switch, and `-resent` and `-resuming` are rejected as unknown options too.
+  // Only switches that actually exist are used here; every one of them was verified against the host.
   //
   // `synchronize local` also recurses and only transfers changed files, but it can remove remote files
   // that are absent locally, and the two directories that must never be removed are exactly the two
@@ -219,7 +220,7 @@ try {
 
   const script = [
     `open ${uploadUrl} -hostkey="${hostKey}"`,
-    `put -filemask="*;*/" -resent -resuming=no "${localSpec}" ${remoteDir}/`,
+    `put -filemask="*;*/" "${localSpec}" ${remoteDir}/`,
     `exit`,
   ].join('\r\n');
 
