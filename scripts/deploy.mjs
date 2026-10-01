@@ -392,10 +392,10 @@ try {
     `open ${uploadUrl} -hostkey="${hostKey}"`,
     'option batch on',
     'option confirm off',
-    // `option batch abort` is what makes WinSCP skip, rather than abort on, a `rm` whose target is
-    // already absent. A first deploy has no `dist/` on the host at all, and an abort there would
-    // stop the script before the remaining removals.
-    'option batch abort',
+    // `continue` is the default and is what is wanted here: a `rm` whose target is already absent
+    // reports an error, and a first deploy has no `dist/` on the host at all. `abort` would stop the
+    // script at the first missing target and skip every removal after it.
+    'option batch continue',
     `rm ${remoteDir}/dist/features`,
     `rm ${remoteDir}/dist/config`,
     `rm ${remoteDir}/dist/core`,
@@ -404,6 +404,7 @@ try {
     `rm ${remoteDir}/dist/index.js`,
     `rm ${remoteDir}/dist/index.js.map`,
     `rm ${remoteDir}/dist`,
+    `ls ${remoteDir}/dist`,
     'exit',
   ].join('\r\n');
 
@@ -414,8 +415,20 @@ try {
     ['/ini=' + iniPath, '/script=' + staleScriptPath],
     { encoding: 'utf8', windowsHide: true },
   );
-  if (staleRemoval.status !== 0) {
-    console.log('[deploy] WARNING: could not clear the stale build on the host. Continuing.');
+
+  // WinSCP exits non-zero whenever ANY command in the script reported an error, including the
+  // `rm`s that succeeded before an absent target was reached. Trusting the exit code here reported
+  // a failure for a step that had in fact fully succeeded, which is how a working deploy ends up
+  // announcing itself as broken.
+  //
+  // The authoritative signal is the trailing `ls`, run after every removal. If it lists any compiled
+  // file, the build is still there and the host would restart into stale code. If it cannot find the
+  // directory at all, the goal is met.
+  const staleOutput = (staleRemoval.stdout ?? '').split(password).join('<redacted>');
+  const buildStillPresent = /^index\.js(\.map)?\s/m.test(staleOutput);
+
+  if (buildStillPresent) {
+    console.log('[deploy] WARNING: the stale build is still on the host. Continuing.');
     console.log('[deploy]   The container will restart into the previous build.');
   } else {
     console.log('[deploy] cleared the stale build; the host will compile on restart.');
