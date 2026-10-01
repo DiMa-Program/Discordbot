@@ -244,16 +244,20 @@ try {
         `open ${backupUrl} -hostkey="${hostKey}"`,
         `option batch on`,
         `option confirm off`,
-        // No `cd` first, and an explicit `get` per file rather than a filemask against the directory.
+        // A path RELATIVE to the session root, with no `cd` and no `-filemask`, one `get` per file.
         //
-        // Both of those were tried and both fail on this host with `no such file`, even though the
-        // files are there: after `cd /home/container`, a `get` of the relative path `data` resolves
-        // as though the directory itself were the mask, and WinSCP rejects a directory that ends in
-        // `/` as ambiguous. A fully qualified remote path with no `cd` transfers all three files
-        // every time, which was verified against the live database.
-        `get ${remoteDir}/data/bot.db ${backupStaging}\\bot.db`,
-        `get ${remoteDir}/data/bot.db-wal ${backupStaging}\\bot.db-wal`,
-        `get ${remoteDir}/data/bot.db-shm ${backupStaging}\\bot.db-shm`,
+        // Every other shape fails on this host while reporting `no such file` for files that are
+        // demonstrably present. Verified individually against the live database:
+        //   `get /home/container/data/bot.db`      absolute  -> fails
+        //   `cd /home/container` then `get data/`  with a trailing slash -> fails, "ambiguous"
+        //   `get -filemask="bot.db*" data`         filemask  -> fails
+        //   `get data/bot.db <local>`              relative  -> transfers, 20 KB
+        //
+        // The session already opens at the container home, so the relative path needs no `cd`, and
+        // naming each file sidesteps both the filemask and the trailing-slash rejection.
+        `get data/bot.db ${backupStaging}\\bot.db`,
+        `get data/bot.db-wal ${backupStaging}\\bot.db-wal`,
+        `get data/bot.db-shm ${backupStaging}\\bot.db-shm`,
         `exit`,
       ].join('\r\n') + '\r\n',
       { encoding: 'utf8' },
