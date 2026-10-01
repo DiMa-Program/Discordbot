@@ -10,6 +10,9 @@ editing a single core file.
   stay off until you ask for them, and only the ones a feature actually needs are requested.
 - **Deploy-safe.** Command deployment refuses to publish if a command exists on disk but was
   never registered, so you cannot ship a command with no handler behind it.
+- **Data survives a restart.** Links and per-server settings are stored in SQLite through Node's
+  built-in `node:sqlite`. No new package, no native build step. See
+  [Data and restarts](#data-and-restarts).
 
 ## Quick path
 
@@ -36,7 +39,8 @@ from.
 | Discord account | — | Needed to create the application. |
 | A Discord server | — | Your own test server is enough. |
 
-Python is not required. Nothing is compiled to a native binary.
+Python is not required. Nothing is compiled to a native binary — the database is Node's built-in
+`node:sqlite`, not a native addon, so `npm install` has no build step to fail.
 
 ## Create the application
 
@@ -67,6 +71,30 @@ The bot reads secrets from the environment, loading `.env` at startup. `.env` is
 | `LOG_LEVEL` | no | `info` | One of `trace`, `debug`, `info`, `warn`, `error`, `fatal`, `silent`. |
 | `ENABLE_PRIVILEGED_INTENTS` | no | `false` | Opt in to the privileged intents features declare. See below. |
 | `HENRIK_DEV_API_KEY` | no | *(unset)* | Key for the VALORANT rank provider. Unset means the ranks feature is inert: `/menu` still works and explains what is missing. Get one at [henrikdev.xyz](https://henrikdev.xyz/account). |
+| `DATABASE_PATH` | no | `<project root>/data/bot.db` | Where the SQLite database lives. `:memory:` runs with no file at all. See [Data and restarts](#data-and-restarts). |
+
+## Data and restarts
+
+**Links and greeting settings are stored in SQLite, so they survive a restart, a redeploy and a
+crash.** The bot adds **no new dependency**: it uses Node's built-in `node:sqlite`, so there is no
+native module to build and nothing new in `package.json`.
+
+| Question | Answer |
+|----------|--------|
+| Where is the file? | `<project root>/data/bot.db`, created on first run along with the `data/` directory. |
+| Is it committed? | **No.** `data/` and `*.db` are gitignored. The file holds linked Riot IDs. |
+| Can I move it? | Yes — set `DATABASE_PATH` to an absolute path. |
+| Is the path relative to the code or to where I started the bot? | **The code.** It resolves from the module's own location, so a systemd unit or a `pm2` config that starts the bot from a different directory still opens the same file. A bot started from an unexpected working directory cannot silently create a second, empty database. |
+| Can I throw the data away? | Delete `data/`, or set `DATABASE_PATH=:memory:`. |
+| What if the schema changes? | Migrations run automatically at startup, in order, tracked by `PRAGMA user_version`. Starting the bot never drops or recreates a table. |
+
+> **⚠️ Upgrading: every member must re-link their Riot ID once.**
+>
+> The old stores kept links in process memory, so there was no file to migrate from. **Nothing
+> carries over.** After the first restart on this version, `/rank` will report that nobody has
+> linked an account, and `/menu` will show the unlinked menu. That is a one-time action per member,
+> not a bug — and it will not happen a second time. Greeting settings have the same caveat: run
+> `/config-greeting` again in each server you had enabled it for.
 
 If `ENABLE_PRIVILEGED_INTENTS` is not already in your `.env`, add it with the value `false`.
 It is optional and that is the default.
@@ -216,10 +244,9 @@ which is what rescues a South American player whose tag does not match.
 | Behaviour | Why |
 |-----------|-----|
 | A promotion takes a few minutes to show | The free tier caches responses for **300 seconds**. The UI never claims the data is live. |
-| `/rank` answered from a cache, with no request | A rank younger than **300 seconds** is already in memory, so re-running the command costs nothing against the 30-requests-per-minute free tier. The answer says it was cached, so it never reads as a live one. |
+| `/rank` answered from a cache, with no request | A rank younger than **300 seconds** is already stored, so re-running the command costs nothing against the 30-requests-per-minute free tier. The answer says it was cached, so it never reads as a live one. |
 | Ranks are named `Ascendant 2`, not `ASCENDANT 2` | Tiers are matched on the **normalised name**, never on Riot's tier id. Riot renumbered every id from 21 up when Ascendant arrived, so an id-based mapping silently assigns the wrong role. A test scans the source to keep it that way. |
 | Roles have plain colours, no icons | Role icons require **Server Boost level 2**. Out of our control. |
-| Links are lost on restart | Storage is an in-memory `Map`, like `welcome/greeting-store.ts`. Members relink after a deploy. |
 | Only the highest rank role is ever held | Discord renders one role's colour, not a blend. The old role is always removed in the same operation that grants the new one. |
 
 ### The `ManageRoles` bit
@@ -322,10 +349,33 @@ A privileged intent in `requiredIntents` is still only requested when
 
 ### Optional: shared state
 
-Keep a module-scoped `Map` next to the feature, the way `src/features/welcome/greeting-store.ts`
-does. It dies with the process, which is fine while a feature is young. `src/features/*/commands/`
-files are scanned for deployment, so a shared helper belongs in the feature root, not in
-`commands/`.
+Anything a feature must remember between commands needs a table. A module-scoped `Map` is no longer
+enough: it dies with the process, which is the bug that made every member relink after each deploy.
+Both shipped features show the pattern — a store module in the feature folder that reads and writes
+through `src/core/db.ts` and keeps its own row mapper:
+
+```ts
+// src/features/streak/streak-store.ts
+import { getDatabase, requireNumber } from '../../core/db.js';
+
+const TABLE = 'streaks';
+
+export function currentStreak(userId: string): number {
+  const row = getDatabase().prepare(`SELECT days FROM ${TABLE} WHERE user_id = ?`).get(userId);
+  return row === undefined ? 0 : requireNumber(row, TABLE, 'days');
+}
+```
+
+| Rule | Why |
+|------|-----|
+| Depend on the `Database` interface, never on `node:sqlite` types | Nothing outside `core/db.ts` names the driver, so it stays swappable. |
+| Map every row to your own type at the boundary | `node:sqlite` returns loose values. `requireNumber` and friends keep `unknown` out of feature code. |
+| Make optional columns nullable, and read `null` back as `null` | A `null` read as `0` would tell a member their rank is zero. |
+| Add a new table as a **new** migration version | Never renumber an applied one, or a deployed database ends up with a schema its own version marker does not describe. |
+| Keep the store's public API synchronous | `node:sqlite` is synchronous, so a read costs the same as the `Map.get` it replaced. |
+
+`src/features/*/commands/` files are scanned for deployment, so a shared helper belongs in the
+feature root, not in `commands/`.
 
 ### The two discovery paths
 
@@ -364,8 +414,9 @@ commands appear in about a second; global ones can take up to an hour to propaga
 
 ```
 src/
-  index.ts                     entrypoint: load env, build client, login
+  index.ts                     entrypoint: load env, open database, build client, login
   config/env.ts                pure validation; no process.env at import time
+  core/db.ts                   the ONLY module that imports node:sqlite; handle + migrations
   core/logger.ts               pino root + child logger, redacts credentials
   core/permissions.ts          permission set and invite-URL builder (no client needed)
   core/registry.ts             feature discovery, wiring plan, command routing and collection
@@ -382,6 +433,11 @@ Pure logic is separated from discord.js objects on purpose: `permissions.ts`, `r
 `env.ts` are all testable without a client, a token or a `.env` file. The ranks feature keeps the
 same split inside its folder — `tiers.ts`, `regions.ts` and `role-sync.ts` hold the rules, and only
 `interaction.ts` and the discord.js gateway adapter touch the library.
+
+`core/db.ts` is the one place that imports `node:sqlite`, which is what keeps the driver swappable
+and lets the whole suite run against `:memory:`. Each feature owns its own table and its own row
+mapper (`valorant_links` in `ranks/store.ts`, `welcome_settings` in `welcome/greeting-store.ts`),
+while the ordered, versioned migration list lives beside the handle it applies to.
 
 ## Troubleshooting
 
@@ -404,7 +460,9 @@ same split inside its folder — `tiers.ts`, `regions.ts` and `role-sync.ts` hol
 | A promotion does not show up | The free tier caches for 300 seconds | Wait five minutes, then **Refresh rank**. |
 | `/rank` not in the picker | The command was never deployed | Run `npm run deploy:commands` again. |
 | `/rank` says a member has not linked | They never used **Link account** | Expected. Nothing is looked up until they link. |
-| Everyone had to relink | Links live in memory and die with the process | Expected. Replace `ranks/store.ts` with a real store. |
+| Everyone had to relink after updating | One-time: the previous build kept links in memory, and there was no file to migrate | Run `/menu` → **Link account** once. From this version on, links survive a restart. |
+| Greetings stopped after updating | Same one-time migration — greeting settings were also in memory | Run `/config-greeting` again in each server. |
+| `database could not be opened or migrated` at startup | The file is not writable, or it was written by a newer build | Check `DATABASE_PATH` and the folder's permissions. A database from a newer version is refused on purpose rather than written to wrongly. |
 | `feature manifests and the commands/ tree disagree` | A command file is not listed in its feature `index.ts` | Add it to the `commands` array, or remove the file. |
 | `duplicate command name: the first registration wins` | Two features claim the same command name | Rename one of them. |
 | `The client needs to be logged in to generate an invite link` | Calling `client.generateInvite` directly | Use `buildInstallUrl` from `src/core/permissions.ts` instead. It needs no client. |
@@ -419,4 +477,6 @@ same split inside its folder — `tiers.ts`, `regions.ts` and `role-sync.ts` hol
 - [ ] `/menu` shows the menu; **Create rank roles** creates 26 roles and is safe to run twice.
 - [ ] `/rank` replies ephemerally with your own rank; `/rank member:@someone` works for a linked
       member and refuses an unlinked one.
+- [ ] `data/` exists after the first run, and `git status` does not list it.
+- [ ] Restart the bot and run `/rank` again: the link is still there. That is the whole point.
 - [ ] `.env` is gitignored and was never committed.

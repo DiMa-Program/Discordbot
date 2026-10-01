@@ -7,6 +7,7 @@
 
 import { createBot } from './client/bot.js';
 import { formatEnvIssues, loadEnv } from './config/env.js';
+import { getDatabase, readDatabasePath } from './core/db.js';
 import { createChildLogger } from './core/logger.js';
 import { loadFeatures, resolveFeaturesDir } from './core/registry.js';
 
@@ -34,6 +35,20 @@ async function main(): Promise<void> {
       { featuresDir },
       'no features found: add a folder under src/features/ that default-exports a Feature',
     );
+    process.exitCode = 1;
+    return;
+  }
+
+  // Opened and migrated HERE, before login, even though the stores would open it lazily anyway.
+  // A database that cannot be opened or a schema this build cannot understand has to be a startup
+  // failure the operator reads in the log — not a `Something went wrong` in a channel, the first
+  // time somebody happens to run `/menu`. The path is logged because "which file is it actually
+  // using" is the first question when a link appears to have vanished, and it is not guessable.
+  try {
+    getDatabase();
+    log.info({ database: readDatabasePath() }, 'database ready');
+  } catch (error) {
+    log.error({ err: error, database: readDatabasePath() }, 'database could not be opened or migrated');
     process.exitCode = 1;
     return;
   }
