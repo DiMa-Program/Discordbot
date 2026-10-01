@@ -344,7 +344,9 @@ async function handleUnlink(interaction: ButtonInteraction, log: Logger): Promis
 
   await interaction.reply({
     content: wasLinked
-      ? `Unlinked. Your Riot ID has been deleted from this bot's memory. ${roleOutcome}`
+      ? // "Deleted", not "deleted from memory": the link lived in a database, and the member is
+        // being told their Riot ID is gone from this bot rather than where the bytes happened to be.
+        `Unlinked. Your Riot ID has been deleted. ${roleOutcome}`
       : 'Nothing was linked for you, so there was nothing to unlink.',
     ephemeral: true,
   });

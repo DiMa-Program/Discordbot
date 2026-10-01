@@ -1,5 +1,10 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+
+import { closeDatabase } from '../../core/db.js';
 import { RANK_CACHE_TTL_MS, type RankSnapshot } from './provider.js';
 import {
   cacheRank,
@@ -92,7 +97,7 @@ describe('the link store', () => {
     expect(linkedAccountCount()).toBe(0);
   });
 
-  it('clears every link on reset, which is what a restart does', () => {
+  it('clears every link on reset, which nothing in the running bot calls', () => {
     linkAccount(USER, { name: 'First', tag: 'EU1' });
     linkAccount(OTHER_USER, { name: 'Second', tag: 'NA1' });
 
@@ -168,7 +173,7 @@ describe('the rank cache', () => {
     expect(getCachedRank(OTHER_USER)?.snapshot.tierName).toBe('RADIANT');
   });
 
-  it('clears the cached ranks on reset, which is what a restart does', () => {
+  it('clears the cached ranks on reset, and is still not what a restart does', () => {
     cacheRank(USER, snapshot(), NOW);
     cacheRank(OTHER_USER, snapshot(), NOW);
 
@@ -176,5 +181,190 @@ describe('the rank cache', () => {
 
     expect(getCachedRank(USER)).toBeNull();
     expect(getCachedRank(OTHER_USER)).toBeNull();
+  });
+});
+
+/* -------------------------------------------------------------------------------------------- */
+/* Persistence                                                                                    */
+/* -------------------------------------------------------------------------------------------- */
+
+/**
+ * Temp directories this file created, so a persistence test can never leave anything behind.
+ *
+ * Under the OS temp directory, never the working tree: a test that creates `data/` is a failing
+ * test, and the point of the tests below is to prove the file survives a restart, not to litter the
+ * repository with it.
+ */
+const scratchDirs: string[] = [];
+
+afterEach(() => {
+  while (scratchDirs.length > 0) {
+    const dir = scratchDirs.pop();
+    if (dir !== undefined) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+/**
+ * Runs `body` twice against the SAME file, with the handle closed in between.
+ *
+ * `phase` is `'before'` for the first run and `'after'` for the second, and nothing carries over in
+ * memory: the store resolves its handle on every call, so the second phase opens a genuinely new
+ * connection. Anything still readable in `'after'` was really written to disk — which is the only
+ * way to test this, because a suite that only ever round-trips through one live handle would pass
+ * against a persistence layer that persisted nothing.
+ */
+function acrossRestart(body: (phase: 'before' | 'after') => void): void {
+  const dir = mkdtempSync(path.join(tmpdir(), 'discordbot-ranks-'));
+  scratchDirs.push(dir);
+  const previous = process.env['DATABASE_PATH'];
+  process.env['DATABASE_PATH'] = path.join(dir, 'restart.db');
+
+  /** One "process": a fresh handle, closed again on the way out. */
+  const session = (run: () => void): void => {
+    closeDatabase();
+    try {
+      run();
+    } finally {
+      closeDatabase();
+    }
+  };
+
+  try {
+    session(() => body('before'));
+    session(() => body('after'));
+  } finally {
+    if (previous === undefined) {
+      delete process.env['DATABASE_PATH'];
+    } else {
+      process.env['DATABASE_PATH'] = previous;
+    }
+  }
+}
+
+describe('surviving a restart', () => {
+  it('still has the link after the process handle is closed and reopened', () => {
+    acrossRestart((phase) => {
+      if (phase === 'before') {
+        linkAccount(USER, { name: 'Dipplox', tag: 'LPARG' }, NOW);
+        return;
+      }
+      expect(getLinkedAccount(USER)).toEqual({
+        name: 'Dipplox',
+        tag: 'LPARG',
+        userId: USER,
+        linkedAt: NOW,
+      });
+      expect(isLinked(USER)).toBe(true);
+      expect(linkedAccountCount()).toBe(1);
+    });
+  });
+
+  it('still has the cached rank, with its timestamp, so the cache window survives too', () => {
+    acrossRestart((phase) => {
+      if (phase === 'before') {
+        linkAccount(USER, { name: 'Dipplox', tag: 'LPARG' }, NOW);
+        cacheRank(USER, snapshot(), NOW);
+        return;
+      }
+      const cached = getCachedRank(USER);
+      expect(cached?.snapshot).toEqual(snapshot());
+      expect(cached?.fetchedAt).toBe(NOW);
+      // The freshness rule still works on a rank that was read before the restart, because the
+      // timestamp travelled with it rather than being reset to "now".
+      expect(isRankCacheFresh(cached!, NOW)).toBe(true);
+      expect(isRankCacheFresh(cached!, NOW + RANK_CACHE_TTL_MS)).toBe(false);
+    });
+  });
+
+  it('still honours an unlink made before the restart, instead of resurrecting the link', () => {
+    acrossRestart((phase) => {
+      if (phase === 'before') {
+        linkAccount(USER, { name: 'Dipplox', tag: 'LPARG' }, NOW);
+        cacheRank(USER, snapshot(), NOW);
+        expect(unlinkAccount(USER)).toBe(true);
+        return;
+      }
+      // Consent is deleted, not cached: a row that came back would keep answering questions about
+      // an account whose owner asked the bot to stop.
+      expect(getLinkedAccount(USER)).toBeNull();
+      expect(getCachedRank(USER)).toBeNull();
+      expect(unlinkAccount(USER)).toBe(false);
+    });
+  });
+});
+
+/* -------------------------------------------------------------------------------------------- */
+/* Nullable rank columns                                                                          */
+/* -------------------------------------------------------------------------------------------- */
+
+describe('the nullable rank columns', () => {
+  it('reads a link with no successful fetch as no rank at all, not as a zeroed one', () => {
+    linkAccount(USER, { name: 'Dipplox', tag: 'LPARG' }, NOW);
+
+    // A link is only ever written after a successful lookup, but the schema has to survive a
+    // lookup that failed anyway. Every rank column is NULL here, and every one must read back as
+    // absent rather than as 0 or "".
+    expect(getCachedRank(USER)).toBeNull();
+    expect(getLinkedAccount(USER)).toMatchObject({ name: 'Dipplox', tag: 'LPARG', linkedAt: NOW });
+  });
+
+  it('round-trips every rank column when they are all present', () => {
+    linkAccount(USER, { name: 'Dipplox', tag: 'LPARG' }, NOW);
+    const stored = cacheRank(USER, snapshot('ASCENDANT 2'), NOW);
+
+    expect(getCachedRank(USER)).toEqual(stored);
+  });
+
+  it('keeps a null rank reading null instead of turning it into zero', () => {
+    // An account with placements left has no rank rating yet. Reading that as 0 would tell a member
+    // their competitive rank is zero, which is both wrong and alarming.
+    const unplaced: RankSnapshot = {
+      ...snapshot('IRON 1'),
+      inferredAffinity: null,
+      rankRating: null,
+      estimatedElo: null,
+      gamesNeededForRating: 2,
+      lastChange: null,
+    };
+    linkAccount(USER, { name: 'Dipplox', tag: 'LPARG' }, NOW);
+    cacheRank(USER, unplaced, NOW);
+
+    const cached = getCachedRank(USER);
+    expect(cached?.snapshot.rankRating).toBeNull();
+    expect(cached?.snapshot.estimatedElo).toBeNull();
+    expect(cached?.snapshot.lastChange).toBeNull();
+    expect(cached?.snapshot.inferredAffinity).toBeNull();
+    // And the columns that DO have values are unaffected by their absent neighbours.
+    expect(cached?.snapshot.gamesNeededForRating).toBe(2);
+    expect(cached?.snapshot.tierName).toBe('IRON 1');
+    expect(cached?.snapshot.tier).toEqual(findTierByName('IRON 1'));
+    expect(cached?.fetchedAt).toBe(NOW);
+  });
+
+  it('reads a tier the catalog does not know as no tier, and keeps the name it was given', () => {
+    // Riot adds tiers. A cached rank must not become unreadable when this build has not heard of one.
+    const unknown = snapshot('Ascendant 4');
+    expect(unknown.tier).toBeNull();
+    cacheRank(USER, unknown, NOW);
+
+    const cached = getCachedRank(USER);
+    expect(cached?.snapshot.tier).toBeNull();
+    expect(cached?.snapshot.tierName).toBe('Ascendant 4');
+  });
+
+  it('caches a rank for a user with no link, without inventing one', () => {
+    // The rank columns and the link columns are independent, which is what lets this work.
+    cacheRank(USER, snapshot(), NOW);
+
+    expect(getCachedRank(USER)?.snapshot).toEqual(snapshot());
+    expect(getLinkedAccount(USER)).toBeNull();
+    expect(isLinked(USER)).toBe(false);
+    // And a link written afterwards replaces the row without disturbing the rank's own columns'
+    // all-or-nothing rule: it drops the rank, because it belonged to the previous account.
+    linkAccount(USER, { name: 'SomeoneElse', tag: 'EU1' }, NOW + 1_000);
+    expect(getCachedRank(USER)).toBeNull();
+    expect(getLinkedAccount(USER)).toMatchObject({ name: 'SomeoneElse' });
   });
 });

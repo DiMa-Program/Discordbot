@@ -898,8 +898,13 @@ describe('the /rank command', () => {
 
     // A failed read erases nothing: the previous snapshot and its timestamp both survive, so the
     // next run has something to serve if the provider is still unhappy.
+    //
+    // Compared by VALUE, not by identity. The in-memory store could answer `toBe` here because a
+    // `Map` hands back the very object it was given; a row read out of SQLite is rebuilt from
+    // columns, so two reads are never the same object. Identity was a property of holding objects
+    // in memory, never a promise the feature made, and no persistence layer can honour it.
     const after = getCachedRank(USER_ID);
-    expect(after?.snapshot).toBe(stale?.snapshot);
+    expect(after?.snapshot).toEqual(stale?.snapshot);
     expect(after?.fetchedAt).toBe(stale?.fetchedAt);
     expect(repliedText(failing.editReply)).toMatch(/rate limit/i);
     // The credential is one hop away from the request that failed, so it must not be in the reply.
