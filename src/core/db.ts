@@ -28,14 +28,15 @@
  *
  * SCHEMA OWNERSHIP, AND WHY THE MIGRATIONS LIVE HERE.
  *
- * Each feature owns its own table, its own queries and its own row mapper: `valorant_links` belongs
- * to `src/features/ranks/store.ts` and `welcome_settings` to `src/features/welcome/greeting-store.ts`.
- * The DDL sits here because the ordered, versioned list is a property of the DATABASE, not of any
- * one feature: migrations have to run in sequence before a single feature is loaded, and the
- * registry deliberately forbids `core/` importing a feature by name. Letting each feature export its
- * own migration would make the resulting schema depend on folder-scan order, which is not a
- * property anyone should have to reason about. The alternative — a registration call per feature at
- * import time — trades a deterministic list for one that silently changes when a folder is renamed.
+ * Each feature owns its own tables, its own queries and its own row mappers: the two tables in
+ * `src/features/ranks/` belong to `store.ts` and `welcome_settings` to
+ * `src/features/welcome/greeting-store.ts`. The DDL sits here because the ordered, versioned list
+ * is a property of the DATABASE, not of any one feature: migrations have to run in sequence before
+ * a single feature is loaded, and the registry deliberately forbids `core/` importing a feature by
+ * name. Letting each feature export its own migration would make the resulting schema depend on
+ * folder-scan order, which is not a property anyone should have to reason about. The alternative —
+ * a registration call per feature at import time — trades a deterministic list for one that
+ * silently changes when a folder is renamed.
  *
  * MIGRATIONS ARE IDEMPOTENT AND VERSIONED. `PRAGMA user_version` is the schema version; each
  * migration runs once, inside a transaction that also bumps the version, and every statement is
@@ -220,8 +221,8 @@ export interface Migration {
 /**
  * The schema, in order.
  *
- * ONE TABLE PER FEATURE, ONE MIGRATION PER TABLE, and a new table is always a NEW version at the
- * end — never an edit to an existing entry. Renumbering an applied migration is how a deployed
+ * ONE TABLE PER STORED THING, ONE MIGRATION PER TABLE, and a new table is always a NEW version at
+ * the end — never an edit to an existing entry. Renumbering an applied migration is how a deployed
  * database ends up with a schema that no longer matches its own version marker.
  *
  * `valorant_links` — owned by `src/features/ranks/store.ts`.
@@ -241,6 +242,24 @@ export interface Migration {
  * `enabled` is an INTEGER because SQLite has no boolean type, and the feature's row mapper turns it
  * back into a real `boolean` at the boundary. `channel_id` is nullable because "enabled with no
  * channel yet" is a state the command produces and the handler has to recognise.
+ *
+ * `valorant_prompt_decisions` — also owned by `src/features/ranks/store.ts`, and the reason "one
+ * table per feature" is really "one table per stored thing".
+ *
+ * A SECOND TABLE FOR THE SAME FEATURE, ON PURPOSE. The obvious move was a nullable column beside
+ * the link columns, and SQLite refuses it in the only shape that is safe to run against a deployed
+ * database: `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` does not exist, so the alternatives are a
+ * migration whose idempotency rests entirely on the version marker, or a rebuild-and-copy of a
+ * table holding every member's Riot ID. A new table is neither, and it is the better model on its
+ * own terms: a declined member has a decision and NO link, while `unlinkAccount` deletes an entire
+ * `valorant_links` row — so a decision kept there would either vanish on unlink, or re-ask somebody
+ * who deliberately left. Consent answers and account data have different lifetimes, and now they
+ * have different tables.
+ *
+ * `prompt_decision` is TEXT FROM A CLOSED UNION, enforced by the database rather than trusted from
+ * the writer, and `decided_at` is tied to it by a CHECK exactly as `tier_name` is tied to
+ * `rank_fetched_at` above: "never asked" and "answered but not stamped" must not be able to
+ * disagree, and a CHECK is cheaper than remembering to keep two columns in step.
  */
 const MIGRATIONS: readonly Migration[] = [
   {
@@ -280,6 +299,19 @@ const MIGRATIONS: readonly Migration[] = [
         guild_id    TEXT    PRIMARY KEY,
         enabled     INTEGER NOT NULL,
         channel_id  TEXT
+      );
+    `,
+  },
+  {
+    version: 3,
+    name: 'ranks-prompt-decisions',
+    sql: `
+      CREATE TABLE IF NOT EXISTS valorant_prompt_decisions (
+        user_id         TEXT PRIMARY KEY,
+        prompt_decision TEXT,
+        decided_at      INTEGER,
+        CHECK (prompt_decision IS NULL OR prompt_decision IN ('accepted', 'declined')),
+        CHECK ((decided_at IS NULL) = (prompt_decision IS NULL))
       );
     `,
   },

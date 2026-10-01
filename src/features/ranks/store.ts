@@ -37,6 +37,11 @@
  *
  * NOTHING HERE LOGS. A row holds a Riot ID; the store returns rows to the caller that asked for them
  * and has no logger to leak them to.
+ *
+ * TWO TABLES, NOT ONE. `valorant_links` holds account data and this module also owns
+ * `valorant_prompt_decisions`, which holds only the member's answer to the one-time join prompt. See
+ * `PROMPT_TABLE` and the migration comment in `core/db.ts` for why the decision is not a column
+ * beside the link: a decline outlives the absence of a link, and an unlink deletes a whole row.
  */
 
 import {
@@ -52,8 +57,17 @@ import { isAffinity, resolvePlatform, type Affinity, type Platform } from './reg
 import { findTierByName } from './tiers.js';
 import { RANK_CACHE_TTL_MS, type RankSnapshot } from './provider.js';
 
-/** The table this feature owns. */
+/** The table this feature owns for links and cached ranks. */
 const TABLE = 'valorant_links';
+
+/**
+ * The second table this feature owns, holding the join-prompt answer.
+ *
+ * Separate from `valorant_links` because a decision outlives a link in both directions: a member who
+ * declined has a decision and no link, and a member who unlinked has a link row of nothing but a
+ * decision left behind it. See the migration's comment in `core/db.ts` for why it is not a column.
+ */
+const PROMPT_TABLE = 'valorant_prompt_decisions';
 
 /** A Riot ID a member has explicitly linked. */
 export interface LinkedAccount {
@@ -71,6 +85,21 @@ export interface CachedRank {
   /** Epoch milliseconds when this snapshot was fetched, which is what the cache window is measured from. */
   readonly fetchedAt: number;
 }
+
+/**
+ * What a member answered when the bot asked, on join, whether it should track a rank role for them.
+ *
+ * A CLOSED UNION, and `null` rather than `'undecided'` for "never asked": three states need three
+ * spellings, and a member who has never been asked is materially different from one who said no.
+ * Collapsing the second into the third is how a prompt ends up asking twice.
+ *
+ * This is NOT the consent to look a rank up. That remains the link itself, because "yes, give me a
+ * rank role" is not "here is my Riot ID, read it". The value here only ever suppresses a question.
+ */
+export type PromptDecision = 'accepted' | 'declined';
+
+/** Every value `PromptDecision` admits, so the reader and the table cannot disagree. */
+export const PROMPT_DECISIONS: readonly PromptDecision[] = ['accepted', 'declined'];
 
 /* -------------------------------------------------------------------------------------------- */
 /* Statements                                                                                     */
@@ -107,6 +136,19 @@ const RANK_COLUMNS = [
 const RANK_PLACEHOLDERS = RANK_COLUMNS.map(() => '?').join(', ');
 
 const SELECT_ALL = `SELECT * FROM ${TABLE} WHERE user_id = ?`;
+
+/**
+ * Every linked row, in a stable order.
+ *
+ * `ORDER BY user_id` rather than insertion order because the periodic sync turns this list into a
+ * work queue: a list whose order changes between two reads would make "was this member already done
+ * in this pass" depend on the database's mood instead of on the account.
+ */
+const SELECT_LINKED = `
+  SELECT * FROM ${TABLE}
+  WHERE riot_name IS NOT NULL
+  ORDER BY user_id
+`;
 
 /**
  * Writes a link and drops any rank cached under the previous Riot ID — in ONE statement.
@@ -147,6 +189,23 @@ const DELETE_LINK = `DELETE FROM ${TABLE} WHERE user_id = ?`;
 const COUNT_LINKS = `SELECT COUNT(*) AS total FROM ${TABLE} WHERE riot_name IS NOT NULL`;
 
 const DELETE_ALL = `DELETE FROM ${TABLE}`;
+
+/** Reads the decision alone, so a caller never pays for the wide `SELECT *` on the join path. */
+const SELECT_PROMPT_DECISION = `SELECT prompt_decision FROM ${PROMPT_TABLE} WHERE user_id = ?`;
+
+/**
+ * Writes the answer and its timestamp in one statement, for the same reason `UPSERT_LINK` is one
+ * statement: a decision with no timestamp is not a state anything is allowed to observe.
+ */
+const UPSERT_PROMPT_DECISION = `
+  INSERT INTO ${PROMPT_TABLE} (user_id, prompt_decision, decided_at)
+  VALUES (?, ?, ?)
+  ON CONFLICT(user_id) DO UPDATE SET
+    prompt_decision = excluded.prompt_decision,
+    decided_at = excluded.decided_at
+`;
+
+const DELETE_ALL_PROMPT_DECISIONS = `DELETE FROM ${PROMPT_TABLE}`;
 
 /* -------------------------------------------------------------------------------------------- */
 /* Row mapping                                                                                    */
@@ -202,6 +261,26 @@ function toLinkedAccount(row: SqlRow): LinkedAccount | null {
     return null;
   }
   return { name, tag, userId: requireString(row, TABLE, 'user_id'), linkedAt };
+}
+
+/**
+ * Narrows a stored answer to the closed union, treating "no row" as "never asked".
+ *
+ * A row exists only after an answer, so the value is either one of the two literals or the column
+ * is NULL. `null` means "never asked", which is the answer the join prompt needs.
+ *
+ * @throws {TypeError} on a decision this build does not know. The table CHECKs the same union, so
+ *         reaching here means the store and the schema have diverged, and answering anyway would
+ *         mean asking again somebody who already said no.
+ */
+function toPromptDecision(value: string | null): PromptDecision | null {
+  if (value === null) {
+    return null;
+  }
+  if (value === 'accepted' || value === 'declined') {
+    return value;
+  }
+  throw new TypeError('Stored value for "prompt_decision" is not a known decision.');
 }
 
 /**
@@ -287,6 +366,83 @@ export function unlinkAccount(userId: string): boolean {
 /** Number of links currently held. Exists for diagnostics and tests. */
 export function linkedAccountCount(): number {
   return requireNumber(database().prepare(COUNT_LINKS).get() ?? {}, TABLE, 'total');
+}
+
+/**
+ * Every linked account, or an empty list when nobody has linked.
+ *
+ * The periodic sync has to walk the whole set, and nothing above it was built for that: `getLinkedAccount`
+ * is a single-row read and `linkedAccountCount` throws the rows away. One query, one statement.
+ *
+ * Rows that cannot be mapped are DROPPED rather than returned as nulls. The `WHERE riot_name IS NOT
+ * NULL` filter already excludes every row this store does not recognise, so a row that still fails
+ * to map means the CHECK constraint and the mapper have diverged — and handing the scheduler a
+ * half-built account would produce a provider request with an empty Riot ID in it. Silently skipping
+ * it keeps the pass honest: at worst one member goes one interval without a refreshed role.
+ *
+ * Ordered by user id, so two reads of the same database produce the same order. See `SELECT_LINKED`.
+ */
+export function listLinkedAccounts(): readonly LinkedAccount[] {
+  const accounts: LinkedAccount[] = [];
+  for (const row of database().prepare(SELECT_LINKED).all()) {
+    const account = toLinkedAccount(row);
+    if (account !== null) {
+      accounts.push(account);
+    }
+  }
+  return accounts;
+}
+
+/* -------------------------------------------------------------------------------------------- */
+/* The join prompt decision                                                                        */
+/* -------------------------------------------------------------------------------------------- */
+
+/**
+ * What a member answered to the one-time opt-in prompt, or `null` when they have never been asked.
+ *
+ * The single source of truth for "has this member already been prompted". The prompt handler asks
+ * this before it sends anything, which is what makes the prompt one-time rather than best-effort:
+ * a bot that restarts, or a member who rejoins, reads the same answer.
+ */
+export function getPromptDecision(userId: string): PromptDecision | null {
+  const row = database().prepare(SELECT_PROMPT_DECISION).get(userId);
+  if (row === undefined) {
+    return null;
+  }
+  return toPromptDecision(optionalString(row, 'prompt_decision'));
+}
+
+/**
+ * Records what a member answered and returns what was stored.
+ *
+ * An upsert rather than an insert, because a member who accepted, abandoned the modal and later
+ * unlinked can genuinely answer again, and a second answer must win rather than collide with the
+ * first. Only ever called from a button press, so this runs exactly once per human decision.
+ *
+ * @param now epoch milliseconds the answer was given. Injectable so a test can read the column back
+ *             without consulting a clock.
+ */
+export function recordPromptDecision(
+  userId: string,
+  decision: PromptDecision,
+  now: number = Date.now(),
+): PromptDecision {
+  database()
+    .prepare(UPSERT_PROMPT_DECISION)
+    .run(userId, decision, now);
+  return decision;
+}
+
+/**
+ * Drops every recorded decision.
+ *
+ * Test-only, and deliberately NOT folded into `resetLinkedAccounts`: that function means "forget the
+ * links", and a test that wiped consent as a side effect of resetting rank data would quietly lose
+ * the property it is supposed to be checking. Keeping them apart also keeps a future "reset the bot"
+ * command honest — it would have to say which one it means.
+ */
+export function resetPromptDecisions(): void {
+  database().prepare(DELETE_ALL_PROMPT_DECISIONS).run();
 }
 
 /* -------------------------------------------------------------------------------------------- */

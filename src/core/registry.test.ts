@@ -407,15 +407,18 @@ describe('the shipped feature tree', () => {
     const features = await loadFeatures(featuresDir);
     const plan = createRegistry(features, NO_INTENTS);
 
-    // The ranks feature binds its own interactionCreate. The router binds another one on top, which
-    // is two listeners by design: they are disjoint, and features/ranks/ranks.test.ts proves it.
+    // Three bindings, by design. `welcome` and `ranks` both listen for `guildMemberAdd` and are
+    // disjoint: one greets in a configured channel, the other sends a direct message. The ranks
+    // feature binds its own interactionCreate as well, and the router binds another on top of that,
+    // which is two listeners on one event, not a conflict.
     expect(plan.bindings).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ event: 'guildMemberAdd', feature: 'welcome' }),
+        expect.objectContaining({ event: 'guildMemberAdd', feature: 'ranks' }),
         expect.objectContaining({ event: 'interactionCreate', feature: 'ranks' }),
       ]),
     );
-    expect(plan.bindings).toHaveLength(2);
+    expect(plan.bindings).toHaveLength(3);
   });
 
   it('keeps the router and the ranks listener as two separate listeners', async () => {
@@ -427,13 +430,19 @@ describe('the shipped feature tree', () => {
 
     const interactionListeners = on.mock.calls.filter((call) => call[0] === 'interactionCreate');
     expect(interactionListeners).toHaveLength(2);
+    // Both features keep their own join listener, so the registry must not collapse them either.
+    expect(on.mock.calls.filter((call) => call[0] === 'guildMemberAdd')).toHaveLength(2);
   });
 
-  it('flags the privileged intent as missing when it is not enabled', async () => {
+  it('flags the privileged intent as missing for each feature that declared it', async () => {
     const features = await loadFeatures(featuresDir);
     const withPrivileged = createRegistry(features, [GatewayIntentBits.GuildMembers]);
 
+    // Reported per FEATURE, in folder-name order, not deduplicated per intent: each one is a handler
+    // that will never fire, and an operator reading the log needs to know which. The intent itself
+    // is named once in the remediation line, which is the one that tells them what to tick.
     expect(createRegistry(features, NO_INTENTS).missingIntents).toEqual([
+      { feature: 'ranks', intents: [GatewayIntentBits.GuildMembers] },
       { feature: 'welcome', intents: [GatewayIntentBits.GuildMembers] },
     ]);
     expect(withPrivileged.missingIntents).toEqual([]);

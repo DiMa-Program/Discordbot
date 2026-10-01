@@ -55,8 +55,12 @@ afterEach(() => {
   }
 });
 
-/** The tables the current schema is expected to contain, one per feature. */
-const EXPECTED_TABLES: readonly string[] = ['valorant_links', 'welcome_settings'];
+/** The tables the current schema is expected to contain, one per stored thing per feature. */
+const EXPECTED_TABLES: readonly string[] = [
+  'valorant_links',
+  'valorant_prompt_decisions',
+  'welcome_settings',
+];
 
 function tableNames(db: Database): readonly string[] {
   return db
@@ -167,6 +171,76 @@ describe('migrations', () => {
     // A downgrade that silently skips migrations would then write rows the newer schema reads
     // wrongly. Failing at boot is the only safe answer.
     expect(() => applyMigrations(db)).toThrow(/newer than this build/);
+
+    db.close();
+  });
+
+  it('upgrades a database created by the previous schema version without losing anything', () => {
+    const file = path.join(scratchDir(), 'upgrade.db');
+
+    // Built the way a real deployment at the previous version is: every migration but the last one,
+    // then rows a member actually cares about.
+    const previous = SCHEMA_MIGRATIONS.filter((migration) => migration.version < SCHEMA_VERSION);
+    const db = openDatabase({ path: file, migrations: previous });
+    expect(readSchemaVersion(db)).toBe(previous.at(-1)?.version);
+    expect(tableNames(db)).not.toContain('valorant_prompt_decisions');
+    db.prepare('INSERT INTO valorant_links (user_id, riot_name, riot_tag, linked_at) VALUES (?, ?, ?, ?)').run(
+      '111111111111111111',
+      'Dipplox',
+      'LPARG',
+      1_700_000_000_000,
+    );
+    db.prepare('INSERT INTO welcome_settings (guild_id, enabled, channel_id) VALUES (?, ?, ?)').run('guild-1', 1, 'c1');
+    db.close();
+
+    // The real boot path: the file exists, holds a member's link, and is one version behind.
+    const upgraded = openDatabase({ path: file });
+    expect(readSchemaVersion(upgraded)).toBe(SCHEMA_VERSION);
+    expect(tableNames(upgraded)).toEqual([...EXPECTED_TABLES]);
+    // The pre-existing data survived the upgrade untouched. A migration that rebuilt the wrong table
+    // would keep the schema valid and still destroy somebody's link.
+    expect(upgraded.prepare('SELECT riot_name, riot_tag FROM valorant_links WHERE user_id = ?').get('111111111111111111')).toEqual({
+      riot_name: 'Dipplox',
+      riot_tag: 'LPARG',
+    });
+    expect(upgraded.prepare('SELECT enabled FROM welcome_settings WHERE guild_id = ?').get('guild-1')).toEqual({
+      enabled: 1,
+    });
+    // And the new table is usable, which is what "applied" has to mean beyond a version number.
+    upgraded
+      .prepare('INSERT INTO valorant_prompt_decisions (user_id, prompt_decision, decided_at) VALUES (?, ?, ?)')
+      .run('111111111111111111', 'declined', 1_700_000_000_000);
+    expect(
+      upgraded.prepare('SELECT prompt_decision FROM valorant_prompt_decisions WHERE user_id = ?').get('111111111111111111'),
+    ).toEqual({ prompt_decision: 'declined' });
+    upgraded.close();
+
+    // Reopening the upgraded file again is a no-op: version-guarded, never applied twice.
+    const again = openDatabase({ path: file });
+    expect(applyMigrations(again)).toEqual([]);
+    expect(readSchemaVersion(again)).toBe(SCHEMA_VERSION);
+    again.close();
+  });
+
+  it('refuses a decision outside the closed union, so the reader is never trusted with a surprise', () => {
+    const db = openDatabase({ path: MEMORY_PATH });
+
+    expect(() =>
+      db.prepare('INSERT INTO valorant_prompt_decisions (user_id, prompt_decision, decided_at) VALUES (?, ?, ?)').run(
+        '1',
+        'maybe',
+        1_700_000_000_000,
+      ),
+    ).toThrow();
+    // A decision with no timestamp is the same class of mistake as a rank with no tier name: both
+    // would read back as a real answer with nothing to prove when it happened.
+    expect(() =>
+      db.prepare('INSERT INTO valorant_prompt_decisions (user_id, prompt_decision, decided_at) VALUES (?, ?, ?)').run(
+        '2',
+        'accepted',
+        null,
+      ),
+    ).toThrow();
 
     db.close();
   });

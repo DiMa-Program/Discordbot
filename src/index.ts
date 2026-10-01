@@ -10,6 +10,7 @@ import { formatEnvIssues, loadEnv } from './config/env.js';
 import { getDatabase, readDatabasePath } from './core/db.js';
 import { createChildLogger } from './core/logger.js';
 import { loadFeatures, resolveFeaturesDir } from './core/registry.js';
+import { startRankSyncScheduler } from './features/ranks/sync.js';
 
 function reportStartupFailure(error: unknown): void {
   const detail = error instanceof Error ? (error.stack ?? error.message) : String(error);
@@ -54,6 +55,16 @@ async function main(): Promise<void> {
   }
 
   const bot = createBot(env.config, features);
+
+  // Started here rather than declared as a feature handler, because it needs the configured interval
+  // and the registry deliberately builds features with no configuration argument. The scheduler
+  // waits for `clientReady` itself, so this is safe before the login below.
+  startRankSyncScheduler({
+    client: bot.client,
+    intervalMs: env.config.rankSyncIntervalMinutes * 60_000,
+    log: createChildLogger({ scope: 'ranks' }, env.config.logLevel),
+  });
+
   try {
     await bot.client.login(env.config.token);
   } catch (error) {

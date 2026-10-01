@@ -23,13 +23,9 @@
  */
 
 import {
-  ActionRowBuilder,
   EmbedBuilder,
   MessageFlags,
-  ModalBuilder,
   PermissionFlagsBits,
-  TextInputBuilder,
-  TextInputStyle,
 } from 'discord.js';
 import type {
   ButtonInteraction,
@@ -42,25 +38,37 @@ import type {
 import type { Logger } from '../../core/logger.js';
 import { getRankProvider, isRankProviderConfigured } from './context.js';
 import { describeRankFailure, formatRankFailure, NOT_CONFIGURED_MESSAGE } from './messages.js';
+import { promptDecisionForCustomId } from './prompt.js';
 import { parseRiotId, type RiotId } from './provider.js';
 import type { RankSnapshot } from './provider.js';
 import {
   applyRoleAssignment,
   createGuildRoleGateway,
   ensureRankRoles,
-  planRoleAssignment,
   planRoleRemoval,
+  syncMemberRankRole,
   type RankRoleGateway,
   type RoleSyncBlocker,
 } from './role-sync.js';
-import { cacheRank, getCachedRank, getLinkedAccount, isRankCacheFresh, linkAccount, unlinkAccount } from './store.js';
+import {
+  cacheRank,
+  getCachedRank,
+  getLinkedAccount,
+  getPromptDecision,
+  isRankCacheFresh,
+  linkAccount,
+  recordPromptDecision,
+  unlinkAccount,
+} from './store.js';
 import type { LinkedAccount } from './store.js';
 import { RANKS } from './tiers.js';
 import {
+  buildLinkModal,
   buildMenuView,
   buildRankView,
   LINK_MODAL_ID,
   MENU_BUTTONS,
+  PROMPT_DECLINE_TEXT,
   RIOT_ID_FIELD,
   type MenuViewState,
   type RankSubject,
@@ -271,6 +279,15 @@ async function guarded<T extends RankComponentInteraction>(
 }
 
 async function handleButton(interaction: ButtonInteraction, log: Logger): Promise<void> {
+  // The join prompt's two buttons are answered here, on the same listener as the menu's, because a
+  // feature declares each event once. They are a separate branch rather than extra menu buttons:
+  // the prompt ids are namespaced apart from `MENU_BUTTONS`, so no press can be ambiguous.
+  const promptDecision = promptDecisionForCustomId(interaction.customId);
+  if (promptDecision !== null) {
+    await handlePromptButton(interaction, promptDecision, log);
+    return;
+  }
+
   switch (interaction.customId) {
     case MENU_BUTTONS.link:
       await interaction.showModal(buildLinkModal());
@@ -289,25 +306,48 @@ async function handleButton(interaction: ButtonInteraction, log: Logger): Promis
   }
 }
 
-function buildLinkModal() {
-  return new ModalBuilder()
-    .setCustomId(LINK_MODAL_ID)
-    .setTitle('Link your VALORANT account')
-    .addComponents(
-      new ActionRowBuilder<TextInputBuilder>().addComponents(
-        new TextInputBuilder()
-          .setCustomId(RIOT_ID_FIELD)
-          .setLabel('Riot ID')
-          .setPlaceholder('SomePlayer#EU1')
-          .setStyle(TextInputStyle.Short)
-          // The ONLY input in the modal: Discord accepts no other component type inside one, which
-          // is why the region is inferred from the tag instead of asked for.
-          .setRequired(true)
-          .setMinLength(5)
-          .setMaxLength(40),
-      ),
-    )
-    .toJSON();
+/**
+ * One press of one of the one-time prompt's buttons.
+ *
+ * THE ANSWER IS RECORDED BEFORE ANYTHING ELSE HAPPENS, for both buttons. Accepting does not store a
+ * Riot ID — it opens the SAME modal `/menu` opens, and that submission is what the store treats as
+ * consent — but it does record that the member was asked, so somebody who accepted and then closed
+ * the modal is never ambushed by a second identical prompt on their next join.
+ *
+ * A press from somebody who is already decided is answered with the same end state rather than an
+ * error: a button that outlived its question (an open DM, a client with the buttons cached) must not
+ * be able to record a decision that contradicts one already on file.
+ *
+ * @param decision `'accepted'` opens the link modal; `'declined'` ends the conversation for good.
+ */
+async function handlePromptButton(
+  interaction: ButtonInteraction,
+  decision: 'accepted' | 'declined',
+  log: Logger,
+): Promise<void> {
+  const alreadyDecided = getPromptDecision(interaction.user.id);
+  if (alreadyDecided !== null && alreadyDecided !== decision) {
+    log.info(
+      { userId: interaction.user.id, recorded: alreadyDecided, pressed: decision },
+      'ignored a repeated rank prompt answer',
+    );
+    await interaction.update({ content: PROMPT_DECLINE_TEXT, components: [] });
+    return;
+  }
+
+  recordPromptDecision(interaction.user.id, decision);
+
+  if (decision === 'accepted') {
+    // The one modal, from the view layer: `LINK_MODAL_ID` and `RIOT_ID_FIELD` are identical to the
+    // `/menu` path, so `handleModalSubmit` below is the only handler that can write a Riot ID.
+    await interaction.showModal(buildLinkModal());
+    return;
+  }
+
+  log.info({ userId: interaction.user.id }, 'rank opt-in declined; not asking again');
+  // `update`, not `reply`: the buttons are replaced in place so the question cannot be answered
+  // twice, and the member is not sent a second message in their own inbox.
+  await interaction.update({ content: PROMPT_DECLINE_TEXT, components: [] });
 }
 
 async function handleRefresh(interaction: ButtonInteraction, log: Logger): Promise<void> {
@@ -464,6 +504,11 @@ interface RoleChangeNote {
  *
  * Silent on the clean path, because "your role was applied" on every successful refresh is noise,
  * and "I could not do this" is not.
+ *
+ * Delegated to `syncMemberRankRole`, which is the same routine the automatic pass uses. That is the
+ * whole reason it is not written out again here: two copies of "read what they hold, plan, apply"
+ * would be free to disagree, and disagreeing about which stale role gets removed is how a member ends
+ * up wearing two rank roles and seeing the wrong colour with nothing in any log.
  */
 async function applyRankRole(
   guild: Guild,
@@ -471,30 +516,19 @@ async function applyRankRole(
   snapshot: RankSnapshot,
   log: Logger,
 ): Promise<RoleChangeNote> {
-  const gateway = createGuildRoleGateway(guild);
-  const held = await readMemberRoleIds(gateway, userId, log);
-  if (held === null) {
+  const outcome = await syncMemberRankRole(createGuildRoleGateway(guild), snapshot.tier, userId);
+
+  if (outcome.outcome === 'member-unreadable') {
     // The plan cannot be built without knowing what the member already holds: granting blind would
-    // leave two rank roles on them, and Discord would render the higher one — the exact silent
-    // wrong-rank this feature exists to avoid.
+    // leave two rank roles on them, and Discord would render the higher one.
+    log.warn({ userId }, 'could not read the member roles; skipping the rank role change');
     return { content: COULD_NOT_READ_ROLES };
   }
-
-  const plan = planRoleAssignment({
-    tiers: RANKS,
-    guildRoles: await gateway.listRankRoles(),
-    memberRoleIds: held,
-    tier: snapshot.tier,
-    canManageRoles: gateway.canManageRoles,
-    botTopPosition: gateway.botTopPosition,
-  });
-
-  const result = await applyRoleAssignment(gateway, plan, userId);
-  if (result.blockedBy !== null) {
-    log.warn({ blockedBy: result.blockedBy, userId }, 'rank role sync refused');
-    return { content: describeBlocker(result.blockedBy) };
+  if (outcome.blockedBy !== null) {
+    log.warn({ blockedBy: outcome.blockedBy, userId }, 'rank role sync refused');
+    return { content: describeBlocker(outcome.blockedBy) };
   }
-  if (result.assignedRoleId === null) {
+  if (!outcome.applied) {
     return { content: NO_ROLE_FOR_RANK };
   }
   return {};
