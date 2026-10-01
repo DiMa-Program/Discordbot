@@ -33,8 +33,14 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { config as loadDotenv } from 'dotenv';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+// Load .env from the project root explicitly rather than relying on the working directory. Without
+// this the script only saw variables exported in the calling shell, so `npm run deploy` from a fresh
+// terminal reported that things were "missing from your .env" without ever opening the file.
+loadDotenv({ path: path.join(projectRoot, '.env') });
 const stagingDir = path.join(projectRoot, 'dist-package', 'content');
 
 function git(args) {
