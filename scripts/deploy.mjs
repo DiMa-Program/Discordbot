@@ -192,6 +192,12 @@ try {
     );
   }
 
+  // Declared here, before either SFTP step, because the backup needs it too. It used to be declared
+  // inside the upload section, which made the backup step throw "Cannot access 'hostKey' before
+  // initialization" — a Temporal Dead Zone error caught by the backup's own try/catch, so the backup
+  // silently degraded to a warning on every single deploy.
+  const hostKey = process.env['HEAVEN_SFTP_HOST_KEY'] ?? DEFAULT_SSH_HOST_KEY;
+
   // -------------------------------------------------------------------------------------------
   // 3. Back up the live database
   // -------------------------------------------------------------------------------------------
@@ -309,8 +315,6 @@ try {
 
   iniPath = path.join(tmpdir(), `winscp-deploy-${process.pid}.ini`);
   scriptPath = path.join(tmpdir(), `winscp-deploy-${process.pid}.txt`);
-
-  const hostKey = process.env['HEAVEN_SFTP_HOST_KEY'] ?? DEFAULT_SSH_HOST_KEY;
 
   const ini = [
     `HostName=${host}`,
