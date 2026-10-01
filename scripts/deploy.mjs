@@ -468,7 +468,13 @@ try {
   // is the only trustworthy signal that the new build arrived: the transfer itself succeeds whether
   // or not it carried the compiled output, and the previous version of this script reported success
   // while the host kept an hours-old build indefinitely.
-  const landed = output.includes('sync.js') && output.includes('prompt.js');
+  //
+  // The word boundary matters. A bare `includes('sync.js')` also matches `role-sync.js`, which the
+  // previous build contained, so the check passed while `sync.js` was genuinely absent. An earlier
+  // attempt matched both `sync.js` and `prompt.js` and still reported success, which is a reminder
+  // that a verification derived from the wrong evidence is worse than no verification at all.
+  const listing = output.slice(output.indexOf('\nls ') === -1 ? 0 : output.indexOf('\nls '));
+  const landed = /\bsync\.js\b/.test(listing) && /\bprompt\.js\b/.test(listing);
   if (landed) {
     console.log('[deploy] the host now holds the new build.');
   } else {
