@@ -79,16 +79,16 @@ a closed union validated before any request is spent.
 
 ## Task list
 
-- [ ] T1 — `config/env.ts`: optional `HENRIK_DEV_API_KEY`, validated as a non-empty string
-- [ ] T2 — `core/permissions.ts`: add `ManageRoles` to the install link; document the new bitfield
-- [ ] T3 — `features/ranks/tiers.ts`: 25-rank catalog with colors, normalized-name keys, tests
-- [ ] T4 — `features/ranks/regions.ts`: closed affinity union + tag-to-affinity inference, tests
-- [ ] T5 — `features/ranks/provider.ts`: `RankProvider` interface + `HenrikDevRankProvider`
-- [ ] T6 — `features/ranks/store.ts`: user → linked Riot ID, in-memory
-- [ ] T7 — `features/ranks/role-sync.ts`: idempotent role creation + remove-old/assign-new
-- [ ] T8 — `features/ranks/ui/`: `/menu` command, modal, buttons, embeds
-- [ ] T9 — unit tests for all pure logic
-- [ ] T10 — README: permission change, consent flow, boost caveat
+- [x] T1 — `config/env.ts`: optional `HENRIK_DEV_API_KEY`, validated as a non-empty string
+- [x] T2 — `core/permissions.ts`: add `ManageRoles` to the install link; document the new bitfield
+- [x] T3 — `features/ranks/tiers.ts`: 26-rank catalog with colors, normalized-name keys, tests
+- [x] T4 — `features/ranks/regions.ts`: closed affinity union + tag-to-affinity inference, tests
+- [x] T5 — `features/ranks/provider.ts`: `RankProvider` interface + `HenrikDevRankProvider`
+- [x] T6 — `features/ranks/store.ts`: user → linked Riot ID, in-memory
+- [x] T7 — `features/ranks/role-sync.ts`: idempotent role creation + remove-old/assign-new
+- [x] T8 — `features/ranks/ui/`: `/menu` command, modal, buttons, embeds
+- [x] T9 — unit tests for all pure logic
+- [x] T10 — README: permission change, consent flow, boost caveat
 
 ## Acceptance criteria
 
@@ -120,6 +120,60 @@ Parent-verified before implementation:
 
 - Live lookup `Dipplox#LPARG` @ `latam` → Ascendant 2, RR 32, Elo 1932
 - Affinity probe: `na`/`latam`/`br`/`eu`/`ap`/`kr` accepted; `pbe`/`las`/`la`/`oce`/`amer` code 6
-- Tier catalog from `valorant-api.com/v1/competitivetiers`: 24 ranked tiers + UNRANKED
+- Tier catalog from `valorant-api.com/v1/competitivetiers`: 24 ranked steps + UNRANKED
 - Discord Modals accept **only** `TextInput` components — no select menu inside a modal. This is why
   the link flow takes one text field and infers the region rather than offering a dropdown.
+
+Parent-verified after implementation, not taken on report:
+
+- `npm run typecheck` — exit 0
+- `npm test` — 10 files passed, **186 tests passed** (baseline was 4 files / 62 tests)
+- `npm run build` — exit 0
+- Install link regenerated: `permissions=268453888`, listing `SendMessages`, `EmbedLinks`, `ManageRoles`
+  and still explicitly not `Administrator` or `ManageGuild`
+
+## Plan corrections made during implementation
+
+1. **The ladder is 26 ranks, not 25.** The original plan said "24 ranked tiers + UNRANKED = 25" while
+   listing 26 names. The 24 counts ranked *steps* (8 divisions × 3); Radiant is separate. Shipping 25
+   would have left Radiant players with no role.
+2. **`valorant-api.com/v1/competitivetiers` serves two different tables.** Its first entry is the
+   pre-Ascendant `Episode1_CompetitiveTierDataTable`, where id 21 is `IMMORTAL 1` and Ascendant does
+   not exist. The plan's original claim that id 24 was once `IMMORTAL 1` was wrong; the verified claim
+   (21 was Immortal 1, now Ascendant 1) is the one kept. The two-tables problem is the stronger
+   argument against id-based mapping and is what the module comment now cites.
+3. **`default_member_permissions` does not gate buttons.** Discord honours it only on a slash-command
+   payload or a row containing a select menu; `ActionRowBuilder` does not expose the setter for a
+   button row. The create-roles action is therefore gated at runtime on `ManageGuild`. Setting the
+   field on a button row would have been a no-op that reads as protection the user does not have.
+
+## Two design bugs caught by the implementation's own tests
+
+- `planRoleAssignment` originally stripped the old rank role even when the new one could not be
+  granted (hierarchy violation, or the role does not exist). That leaves the member with no rank at
+  all. A blocked plan now removes nothing.
+- A failed member-role read degraded to `[]`, which made the sync grant the new role *without* removing
+  the old one — and Discord renders the higher role, producing a silently wrong rank. It now refuses
+  and reports instead.
+
+## Deployment prerequisites for the operator
+
+1. **Grant `ManageRoles`**: Server Settings → Roles → the bot's role → tick Manage Roles. No reinstall
+   needed; the existing install bitfield only applies to new installs. The feature reads the
+   permission live, so it takes effect on the next `/menu` without a restart.
+2. **Run `npm run deploy:commands`** — `/menu` does not exist in Discord until deployed.
+3. **The bot's role must sit above the rank roles.** `ensureRankRoles` creates them at the bottom of
+   the hierarchy, which is normally correct; if the bot's role is dragged below them afterwards,
+   assignment fails with a message naming the exact knob to turn.
+4. If `HENRIK_DEV_API_KEY` is absent, `/menu` still works and explains the setup. A *blank* value is a
+   startup config error rather than "off", deliberately, so a copy/paste that lost the value surfaces
+   immediately instead of becoming a lookup that silently never works.
+
+## Known limitations
+
+- Links are in-memory and die on restart, matching `welcome/greeting-store.ts`.
+- Ranks are cached by the provider for 300s on the free tier; the UI never claims live data.
+- Roles match by exact name, so a hand-made `Gold 2` with a different colour is adopted rather than
+  duplicated. Intentional for idempotency, but it means the catalog colour is not enforced on
+  pre-existing roles.
+- `npm test` does not typecheck. It can pass green while `tsc` reports errors, so both must run.
