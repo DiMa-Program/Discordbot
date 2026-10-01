@@ -1,0 +1,115 @@
+name: Bot watchdog
+
+# The free instance suspends when it sees no activity, and the suspension surfaces as a gateway
+# handshake timeout roughly four hours in. The process stays alive but stops being a bot: commands
+# hang, no sync pass ever runs, and nothing in the logs says the instance is gone.
+#
+# This job checks the panel from outside and restarts the server when it is not answering. It runs
+# on GitHub, which is independent of the host, of the bot, and of any local machine being switched
+# on. That independence is the entire point: the failure being repaired is the thing that would
+# otherwise host the repair.
+#
+# What it does NOT do is keep the bot alive on its own. It limits the damage to one cron interval,
+# so the longest a suspended instance stays suspended is ten minutes.
+
+on:
+  schedule:
+    # Every ten minutes. Scheduled workflows can be delayed by GitHub's own load, so treat this as
+    # an upper bound on detection time rather than a precise guarantee.
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the instance and restart it if it is down
+        uses: actions/github-script@v7
+        env:
+          # Server and panel are not secret. The key is: it is a live credential for the panel, so it
+          # lives in repository secrets rather than in this file.
+          PANEL: https://control.heavencloud.in
+          SERVER_ID: '164bb413'
+          PANEL_KEY: ${{ secrets.HEAVEN_CLOUDE_API_KEY }}
+        with:
+          script: |
+            const PANEL = process.env.PANEL;
+            const SERVER_ID = process.env.SERVER_ID;
+            const KEY = process.env.PANEL_KEY;
+
+            if (!KEY) {
+              // Failing loudly beats a watchdog that silently never runs. A missing secret looks
+              // exactly like a healthy instance from the outside, which is the failure this job
+              // exists to prevent.
+              core.setFailed(
+                'HEAVEN_CLOUDE_API_KEY is not set as a repository secret, so the watchdog cannot run.\n' +
+                  '  Add it under Settings > Secrets and variables > Actions > New repository secret.',
+              );
+              return;
+            }
+
+            const headers = {
+              Authorization: `Bearer ${KEY}`,
+              Accept: 'Application/vnd.pterodactyl.v1+json',
+              'Content-Type': 'application/json',
+            };
+
+            const base = `${PANEL}/api/client/servers/${SERVER_ID}`;
+
+            // The resources endpoint is the liveness signal. It reports a suspended instance with an
+            // error rather than with a zero reading, so a successful response carrying usage figures
+            // means the container is actually running. A power call alone would not prove that:
+            // Pterodactyl answers `start` for an instance that is already running, and it answers
+            // `409` for one it considers busy, so neither distinguishes "alive" from "wedged".
+            let healthy = false;
+            let detail = '';
+
+            try {
+              const res = await fetch(`${base}/resources`, { headers });
+              if (res.ok) {
+                const body = await res.json();
+                const memory = body?.attributes?.resources?.memory_bytes;
+                healthy = typeof memory === 'number';
+                detail = healthy ? `${(memory / 1048576).toFixed(0)} MB in use` : 'response carried no usage figures';
+              } else {
+                detail = `resources returned HTTP ${res.status}`;
+              }
+            } catch (error) {
+              detail = `resources request failed: ${error.message}`;
+            }
+
+            if (healthy) {
+              core.info(`Instance is up (${detail}). Nothing to do.`);
+              return;
+            }
+
+            core.warning(`Instance looks down (${detail}). Sending start.`);
+
+            try {
+              const power = await fetch(`${base}/power`, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({ signal: 'start' }),
+              });
+
+              // 204 is the success reply. A 409 means the panel considers it already starting or
+              // running, which is a benign outcome for a watchdog: the instance is not known-down.
+              if (power.ok || power.status === 409) {
+                core.info(`Start accepted (HTTP ${power.status}).`);
+              } else {
+                core.setFailed(`Start returned HTTP ${power.status}. The instance may need attention in the panel.`);
+              }
+            } catch (error) {
+              core.setFailed(`Start request failed: ${error.message}`);
+            }
+
+            if (process.env.GITHUB_STEP_SUMMARY !== undefined) {
+              await core.summary
+                .addHeading('Watchdog restarted the bot instance')
+                .addRaw(`Detected as down: ${detail}\n\n`)
+                .addRaw(`Panel: ${PANEL}\n`)
+                .write();
+            }

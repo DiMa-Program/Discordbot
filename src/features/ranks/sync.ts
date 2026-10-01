@@ -370,7 +370,19 @@ export function startRankSyncScheduler(options: RankSyncSchedulerOptions): StopR
     }
   };
 
-  client.once('clientReady', () => {
+  const begin = (): void => {
+    if (handle !== null) {
+      return;
+    }
+
+    // One line at registration time, before any waiting happens. Without it, a scheduler that never
+    // starts is indistinguishable from one that was never requested: the boot log is identical
+    // either way, and the only other signal arrives twelve hours later when nothing happens.
+    log.info(
+      { intervalMinutes: Math.round(intervalMs / 60_000), startingNow: client.isReady() },
+      'rank sync scheduler registered',
+    );
+
     if (!isRankProviderConfigured()) {
       log.warn('HENRIK_DEV_API_KEY is not set: automatic rank sync will not start');
       return;
@@ -388,7 +400,17 @@ export function startRankSyncScheduler(options: RankSyncSchedulerOptions): StopR
     handle = schedule(() => {
       void tick();
     }, SYNC_TICK_MS);
-  });
+  };
+
+  // Registered before login, so the event is normally caught here. The `isReady()` branch covers the
+  // ordering where it has already fired: a `once` listener attached after the event is never called
+  // again, so the scheduler would sit there doing nothing for the lifetime of the process with no
+  // error and no log line to say so. That is exactly the symptom it produced once already.
+  if (client.isReady()) {
+    begin();
+  } else {
+    client.once('clientReady', begin);
+  }
 
   return stop;
 }
