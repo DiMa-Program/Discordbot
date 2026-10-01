@@ -18,11 +18,9 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Readable } from 'node:stream';
-import { createInterface } from 'node:readline';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const outputDir = path.join(projectRoot, 'dist-package');
@@ -81,54 +79,43 @@ const archivePath = path.join(outputDir, archiveName);
 
 execFileSync('git', ['archive', '--format=zip', `-o${archivePath}`, 'HEAD'], { cwd: projectRoot });
 
-// Verify the archive rather than trusting the tool. A leaked .env here means a token on a shared
-// host, and an archive missing the entrypoint just wastes another round trip.
-const listing = execFileSync(
-  'git',
-  ['archive', '--format=tar', 'HEAD'],
-  { cwd: projectRoot, encoding: 'buffer', maxBuffer: 64 * 1024 * 1024 },
-);
+// Verify against `git ls-tree` rather than by unpacking the zip. `git archive` emits exactly the tree
+// of the given commit, so the tree listing is the authoritative answer to "what is in this archive",
+// and it needs no zip parsing and no shell tooling that differs across platforms. An earlier version
+// scanned a tar stream for forbidden prefixes and matched on file *contents* rather than entry names,
+// which reported a leak that did not exist.
+const entries = git(['ls-tree', '-r', '--name-only', 'HEAD']).split('\n').filter((line) => line !== '');
 
-const entries = new Set();
-await new Promise((resolve, reject) => {
-  const stream = Readable.from(listing);
-  const rl = createInterface({ input: stream });
-  // The tar header keeps the entry name in its first header line, which is enough for a name scan.
-  rl.on('line', (line) => {
-    const name = line.slice(0, 100).trim();
-    if (name !== '' && !name.startsWith('#') && name.includes('/')) entries.add(name);
-  });
-  rl.on('close', resolve);
-  rl.on('error', reject);
-});
-
-const forbidden = ['.env', 'node_modules/', 'dist/', 'data/'];
-const problems = forbidden.filter((prefix) =>
-  [...entries].some((entry) => entry === prefix || entry.startsWith(prefix)),
-);
+const forbidden = ['.env', 'node_modules', 'dist', 'data'];
+const problems = entries.filter((entry) => forbidden.some((prefix) => entry === prefix || entry.startsWith(`${prefix}/`)));
 
 if (problems.length > 0) {
-  console.error(`[package] refusing to hand over an archive containing: ${problems.join(', ')}`);
+  console.error(`[package] refusing to hand over an archive containing: ${problems.slice(0, 5).join(', ')}`);
   process.exit(1);
 }
 
-if (!entries.has('index.js')) {
+if (!entries.includes('index.js')) {
   console.error('[package] refusing: the archive has no root index.js, so the host cannot boot it.');
   process.exit(1);
 }
 
-const files = readdirSync(outputDir);
-const sizeKb = Math.round(Number(execFileSync('powershell', ['-NoProfile', '-Command', '(Get-Item -LiteralPath $args[0]).Length', archivePath], { encoding: 'utf8' }).trim()) / 1024);
+if (!entries.includes('package.json')) {
+  console.error('[package] refusing: the archive has no package.json, so nothing will be installed.');
+  process.exit(1);
+}
+
+const fileCount = entries.length;
+const sizeKb = Math.round(statSync(archivePath).size / 1024);
 
 console.log('');
 console.log('  Package ready');
 console.log('  -------------');
-console.log(`  file   : dist-package/${archiveName}`);
-console.log(`  branch : ${branch}`);
-console.log(`  commit : ${shortSha}`);
-console.log(`  size   : ~${sizeKb} KB`);
+console.log(`  file    : dist-package/${archiveName}`);
+console.log(`  branch  : ${branch}`);
+console.log(`  commit  : ${shortSha}`);
+console.log(`  files   : ${fileCount}`);
+console.log(`  size    : ~${sizeKb} KB`);
 console.log('');
-console.log('  Upload it: Files -> Upload -> Extract over /home/container -> Restart.');
-console.log('  The archive carries no .env, no node_modules and no dist, so your secrets and');
-console.log('  your database are never overwritten.');
+console.log('  Verified: no .env, no node_modules, no dist, no data. Your secrets and your');
+console.log('  database are never part of the upload.');
 console.log('');
