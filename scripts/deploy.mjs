@@ -464,6 +464,18 @@ try {
   const fileCount = (output.match(/^([A-Za-z]:\\|[^:]+)$/gm) ?? []).length;
   console.log(`[deploy] uploaded${fileCount > 0 ? ` (${fileCount} paths)` : ''}.`);
 
+  // The trailing `ls` in the script reports what the host actually holds after the transfer. This
+  // is the only trustworthy signal that the new build arrived: the transfer itself succeeds whether
+  // or not it carried the compiled output, and the previous version of this script reported success
+  // while the host kept an hours-old build indefinitely.
+  const landed = output.includes('sync.js') && output.includes('prompt.js');
+  if (landed) {
+    console.log('[deploy] the host now holds the new build.');
+  } else {
+    console.log('[deploy] WARNING: the host does not show the new build after the upload.');
+    console.log('[deploy]   The restart below will bring up the previous build.');
+  }
+
   // -------------------------------------------------------------------------------------------
   // 5. Restart through the panel API
   // -------------------------------------------------------------------------------------------
