@@ -6,6 +6,9 @@ dist/
 dist-package/
 *.tsbuildinfo
 
+# Database backups pulled off the host before each deploy
+backups/
+
 # Secrets — never commit
 .env
 .env.*
