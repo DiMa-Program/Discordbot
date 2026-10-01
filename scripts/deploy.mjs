@@ -138,6 +138,7 @@ function fail(message) {
 let winscp = null;
 let iniPath = null;
 let scriptPath = null;
+let staleScriptPath = null;
 
 try {
   const dirty = git(['status', '--porcelain']).trim();
@@ -217,6 +218,9 @@ try {
   // A backup failure warns and continues. Blocking a deploy on a backup would be worse than the
   // problem it protects against, since the deploy itself does not touch `data/`.
 
+  // Under the project root, NOT the OS temp directory. WinSCP runs as a separate process and the
+  // temp path this script creates is not writable from it; the transfer fails with a Windows
+  // "Access denied" that has nothing to do with the host. A project-relative path is writable.
   const backupStaging = path.join(projectRoot, 'dist-package', 'backup-download');
 
   try {
@@ -241,7 +245,7 @@ try {
         `option batch on`,
         `option confirm off`,
         `cd /home/container`,
-        `get -filemask="bot.db*" data/ ${backupStaging.replace(/\\/g, '/')}`,
+        `get -filemask="bot.db*" data/ ${backupStaging}`,
         `exit`,
       ].join('\r\n') + '\r\n',
       { encoding: 'utf8' },
@@ -315,6 +319,7 @@ try {
 
   iniPath = path.join(tmpdir(), `winscp-deploy-${process.pid}.ini`);
   scriptPath = path.join(tmpdir(), `winscp-deploy-${process.pid}.txt`);
+  staleScriptPath = path.join(tmpdir(), `winscp-stale-${process.pid}.txt`);
 
   const ini = [
     `HostName=${host}`,
@@ -357,6 +362,60 @@ try {
     `put -filemask="*;*/|.git" "${localSpec}" ${remoteDir}/`,
     `exit`,
   ].join('\r\n');
+
+  // -------------------------------------------------------------------------------------------
+  // 5b. Remove the stale compiled output so the host rebuilds
+  // -------------------------------------------------------------------------------------------
+  //
+  // WHY THIS IS REQUIRED
+  //
+  // `dist/` is gitignored, so the staged worktree never contains it and the upload never replaces
+  // it. Meanwhile `index.js` only compiles when `dist/index.js` is ABSENT. Together those two facts
+  // meant every deploy after the first shipped source code that was never executed: the container
+  // restarted into the build from whenever it was originally compiled, indefinitely. It looks like
+  // a successful deploy because the upload succeeds and the restart succeeds.
+  //
+  // The failure is silent and it is the worst kind, because the running code is plausible. A fix
+  // merged and pushed shows up as "nothing happens", which reads as a Discord or permissions problem
+  // rather than a packaging one.
+  //
+  // Removing the directory is what makes `index.js` take its build branch. It is safe to do here
+  // because it happens BEFORE the restart: the currently running process holds its modules in
+  // memory, and a delete of already-loaded files does not disturb it. If the build then fails on
+  // the host the bot stays down, but that is a build failure the operator has to see anyway, and a
+  // knowingly stale build is the worse outcome.
+  //
+  // `rm` is issued without `-r`, because WinSCP rejects that switch on this build, and a non-empty
+  // `dist/` cannot be removed that way. Removing the nested compiled files first is what actually
+  // works, and it was verified against the host.
+  const staleScript = [
+    `open ${uploadUrl} -hostkey="${hostKey}"`,
+    'option batch on',
+    'option confirm off',
+    `rm ${remoteDir}/dist/features`,
+    `rm ${remoteDir}/dist/config`,
+    `rm ${remoteDir}/dist/core`,
+    `rm ${remoteDir}/dist/client`,
+    `rm ${remoteDir}/dist/scripts`,
+    `rm ${remoteDir}/dist/index.js`,
+    `rm ${remoteDir}/dist/index.js.map`,
+    `rm ${remoteDir}/dist`,
+    'exit',
+  ].join('\r\n');
+
+  writeFileSync(staleScriptPath, staleScript + '\r\n', { encoding: 'utf8' });
+
+  const staleRemoval = spawnSync(
+    winscp,
+    ['/ini=' + iniPath, '/script=' + staleScriptPath],
+    { encoding: 'utf8', windowsHide: true },
+  );
+  if (staleRemoval.status !== 0) {
+    console.log('[deploy] WARNING: could not clear the stale build on the host. Continuing.');
+    console.log('[deploy]   The container will restart into the previous build.');
+  } else {
+    console.log('[deploy] cleared the stale build; the host will compile on restart.');
+  }
 
   writeFileSync(scriptPath, script + '\r\n', { encoding: 'utf8' });
 
@@ -427,6 +486,7 @@ try {
   if (iniPath !== null) rmSync(iniPath, { force: true });
   // The script file carries the password, so it is the one artifact that must not survive the run.
   if (scriptPath !== null) rmSync(scriptPath, { force: true });
+  if (staleScriptPath !== null) rmSync(staleScriptPath, { force: true });
   try {
     execFileSync('git', ['worktree', 'remove', '--force', stagingDir], { cwd: projectRoot, stdio: 'ignore' });
   } catch {
