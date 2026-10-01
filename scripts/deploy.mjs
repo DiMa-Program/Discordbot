@@ -41,7 +41,17 @@ const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '
 // this the script only saw variables exported in the calling shell, so `npm run deploy` from a fresh
 // terminal reported that things were "missing from your .env" without ever opening the file.
 loadDotenv({ path: path.join(projectRoot, '.env') });
+
 const stagingDir = path.join(projectRoot, 'dist-package', 'content');
+
+/**
+ * The hosting node's SSH host key, pinned so a substituted host cannot receive the SFTP password.
+ *
+ * This is WinSCP's own display form: no `SHA256:` prefix and no trailing `=`. Both of those variants
+ * were tried and both were rejected as a mismatch against the server's real key. Override with
+ * HEAVEN_SFTP_HOST_KEY if the provider ever moves the machine.
+ */
+const DEFAULT_SSH_HOST_KEY = 'ssh-ed25519 255 HjV7vEkMibVIR+NApBvRtt58JlwLERfc2fJcTjkDt2U';
 
 function git(args) {
   return execFileSync('git', args, { cwd: projectRoot, encoding: 'utf8' });
@@ -83,6 +93,7 @@ function fail(message) {
 
 let winscp = null;
 let iniPath = null;
+let scriptPath = null;
 
 try {
   const dirty = git(['status', '--porcelain']).trim();
@@ -151,56 +162,68 @@ try {
   // -------------------------------------------------------------------------------------------
   // 4. Upload over SFTP
   // -------------------------------------------------------------------------------------------
+  //
+  // Two things about WinSCP's CLI took real work to get right, and both are load-bearing:
+  //
+  // HOST KEY. The CLI cannot answer the interactive "do you trust this server?" prompt and aborts
+  // with "the server key has not been verified" before sending any credential. That is why the same
+  // credentials worked in the WinSCP GUI, where the prompt had been answered once. The key is pinned
+  // rather than merely accepted, so a substituted host fails loudly instead of receiving the
+  // password. Note the format is WinSCP's own display form, which has no `SHA256:` prefix and no
+  // trailing `=`.
+  //
+  // PASSWORD. `open sftp://user@host/` builds a fresh session from the URL and ignores whatever the
+  // ini file holds, which ends in "no credentials were provided". Supplying the password on the
+  // command line would fix that, but it is visible to every process listing on the machine for the
+  // life of the process and lands in shell history. Putting it in a temp script file that is created
+  // and deleted within the run keeps it out of both.
+  //
+  // The switches also have to travel in a script file rather than via /command: the `-hostkey` value
+  // contains spaces, and the command-line parser truncates it at the first space.
 
   iniPath = path.join(tmpdir(), `winscp-deploy-${process.pid}.ini`);
+  scriptPath = path.join(tmpdir(), `winscp-deploy-${process.pid}.txt`);
+
+  const hostKey = process.env['HEAVEN_SFTP_HOST_KEY'] ?? DEFAULT_SSH_HOST_KEY;
 
   const ini = [
     `HostName=${host}`,
     `PortNumber=${port}`,
     `UserName=${user}`,
-    `Password=${password}`,
     `Protocol=SFTP`,
     `FSProtocol2=1`,
     `SFTP=1`,
     `PuttyProtocol=putty-sftp`,
     `LocalDirectory=${stagingDir}`,
     `RemoteDirectory=${remoteDir}`,
-    // WHY THE HOST KEY IS PINNED
-    //
-    // WinSCP's CLI cannot answer the interactive "do you trust this server?" prompt. Without a stored
-    // key it aborts with "the server key has not been verified" before it ever sends a credential,
-    // which is why the same credentials worked in the WinSCP GUI (where the prompt was answered once)
-    // and failed here.
-    //
-    // SshHostKeyConfirm=0 alone would silence that, but it would also accept whatever key the host
-    // presents, which is exactly the attack the prompt exists to stop. Pinning the fingerprint means a
-    // substituted host fails loudly instead of receiving the SFTP password.
-    //
-    // Override with HEAVEN_SFTP_HOST_KEY when the provider changes machines. An empty value falls back
-    // to accepting any key, which is only reasonable on a trusted network.
-    `SshHostKey=${process.env['HEAVEN_SFTP_HOST_KEY'] ?? ''}`,
-    `SshHostKeyConfirm=0`,
-    // Do not let a failed transfer look like a successful one.
-    `ConfirmBeforeClose=0`,
+    `Timeout=30`,
     `PingType=1`,
     `PingInterval=10`,
-    `Timeout=30`,
   ].join('\r\n');
 
   writeFileSync(iniPath, `[Configuration]\r\n[Session\\deploy]\r\n${ini}\r\n`, { encoding: 'utf8' });
 
+  const uploadUrl = `sftp://${encodeURIComponent(user)}:${encodeURIComponent(password)}@${host}:${port}/`;
+  const script = [
+    `open ${uploadUrl} -hostkey="${hostKey}"`,
+    `put -recursive -resent -resuming=no * ${remoteDir}/`,
+    `exit`,
+  ].join('\r\n');
+
+  writeFileSync(scriptPath, script + '\r\n', { encoding: 'utf8' });
+
   console.log(`[deploy] ${branch} @ ${shortSha}`);
   console.log(`[deploy] uploading to ${remoteDir} ...`);
 
-  const put = spawnSync(
-    winscp,
-    ['/ini=' + iniPath, '/command', `put -recursive -resent -resuming=no * ${remoteDir}/`, 'exit'],
-    { cwd: stagingDir, encoding: 'utf8', windowsHide: true },
-  );
+  const put = spawnSync(winscp, ['/ini=' + iniPath, '/script=' + scriptPath], {
+    encoding: 'utf8',
+    windowsHide: true,
+  });
 
+  const output = (put.stdout ?? '').split(password).join('<redacted>');
   if (put.status !== 0) {
-    if (put.stdout !== undefined && put.stdout.trim() !== '') console.error(put.stdout);
-    if (put.stderr !== undefined && put.stderr.trim() !== '') console.error(put.stderr);
+    if (output.trim() !== '') console.error(output.trim());
+    if (put.stderr !== undefined && put.stderr.trim() !== '') console.error(put.stderr.trim());
     fail(
       `The upload failed (WinSCP exit ${put.status}).\n` +
         '  Check HEAVEN_SFTP_HOST, HEAVEN_SFTP_PORT and HEAVEN_SFTP_PASSWORD. Whatever was\n' +
@@ -208,7 +231,8 @@ try {
     );
   }
 
-  console.log('[deploy] uploaded.');
+  const fileCount = (output.match(/^([A-Za-z]:\\|[^:]+)$/gm) ?? []).length;
+  console.log(`[deploy] uploaded${fileCount > 0 ? ` (${fileCount} paths)` : ''}.`);
 
   // -------------------------------------------------------------------------------------------
   // 5. Restart through the panel API
@@ -253,6 +277,8 @@ try {
   // makes the next run trip over `git worktree add`, and leaving the staging directory behind
   // invites someone to upload stale files.
   if (iniPath !== null) rmSync(iniPath, { force: true });
+  // The script file carries the password, so it is the one artifact that must not survive the run.
+  if (scriptPath !== null) rmSync(scriptPath, { force: true });
   try {
     execFileSync('git', ['worktree', 'remove', '--force', stagingDir], { cwd: projectRoot, stdio: 'ignore' });
   } catch {
