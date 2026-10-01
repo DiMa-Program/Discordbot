@@ -10,6 +10,12 @@ dist/
 .env.*
 !.env.example
 
+# Local database — holds linked Riot IDs and must never be committed
+data/
+*.db
+*.db-wal
+*.db-shm
+
 # Logs
 logs/
 *.log
