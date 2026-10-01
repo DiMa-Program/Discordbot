@@ -427,6 +427,7 @@ try {
   const script = [
     `open ${uploadUrl} -hostkey="${hostKey}"`,
     `put -filemask="*;*/|.git" "${localSpec}" ${remoteDir}/`,
+    `ls ${remoteDir}/dist/features/ranks`,
     'exit',
   ].join('\r\n');
 
