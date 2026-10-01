@@ -204,9 +204,22 @@ try {
   writeFileSync(iniPath, `[Configuration]\r\n[Session\\deploy]\r\n${ini}\r\n`, { encoding: 'utf8' });
 
   const uploadUrl = `sftp://${encodeURIComponent(user)}:${encodeURIComponent(password)}@${host}:${port}/`;
+
+  // `-filemask="*;*/"` is what makes this recurse: `*` matches files and `*/` matches directories,
+  // so a plain `put *` would upload the top level and skip everything nested under src/. WinSCP has no
+  // `-recursive` switch on `put`, and passing one aborts with "unknown option".
+  //
+  // `synchronize local` also recurses and only transfers changed files, but it can remove remote files
+  // that are absent locally, and the two directories that must never be removed are exactly the two
+  // that are absent locally: `.env` and `data/`. A plain recursive put cannot delete anything.
+  //
+  // The local side is absolute rather than relative to the process working directory, so the transfer
+  // cannot silently pick up the project root instead of the staging checkout.
+  const localSpec = `${stagingDir.replace(/\\/g, '/')}/*`;
+
   const script = [
     `open ${uploadUrl} -hostkey="${hostKey}"`,
-    `put -recursive -resent -resuming=no * ${remoteDir}/`,
+    `put -filemask="*;*/" -resent -resuming=no "${localSpec}" ${remoteDir}/`,
     `exit`,
   ].join('\r\n');
 
