@@ -281,7 +281,10 @@ try {
       const saved = [];
 
       for (const file of fetched) {
-        const target = path.join(backupDir, file.replace(/\.(db-wal|db-shm)$/, '$1') .replace(/^bot\.db/, `bot-${stamp}.db`));
+        // The WAL and SHM sidecars belong to the snapshot above and take the same stamp. They were
+        // previously mangled into `botdb-shm` and `botdb-wal`, which lost the separator and made the
+        // sidecars look like unrelated files rather than part of one consistent snapshot.
+        const target = path.join(backupDir, file.replace(/^bot\.db/, `bot-${stamp}.db`));
         copyFileSync(path.join(backupStaging, file), target);
         saved.push(path.basename(target));
       }
