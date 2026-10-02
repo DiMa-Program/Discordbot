@@ -178,32 +178,33 @@ export const BUILD_MARKER_FILES = Object.freeze(['sync.js', 'prompt.js']);
 // ---------------------------------------------------------------------------------------------
 
 /**
- * Whether the new build is present in the host listing.
+ * Whether the new build is present, judged from the tail of the transfer output.
  *
- * The word boundary is the whole point. A bare `includes('sync.js')` also matches `role-sync.js`,
- * which every build has ever contained, so the check passed while the file it was meant to prove was
+ * WinSCP does not echo commands it runs from a script in batch mode, so there is no line to anchor
+ * on. The last thing the script does is the `ls`, so its output is everything after the final
+ * transferred path. Anchoring on a literal `ls` line instead reported every build as absent,
+ * including the ones that had demonstrably landed.
+ *
+ * The word boundary is the other half. A bare `includes('sync.js')` also matches `role-sync.js`,
+ * which every build has ever contained, so that check passed while the file it was meant to prove was
  * absent. A verification built from the wrong evidence is worse than none, because it converts a
  * silent failure into confident wrongness.
- *
- * Only the listing is examined. WinSCP prints each transferred path as it goes, so a `put` line
- * mentioning a file proves nothing about the remote state.
  */
 export function buildLanded(output, markers = BUILD_MARKER_FILES) {
-  // WinSCP echoes every command before running it, so the listing is whatever follows the last
-  // echoed `ls`. Matching on a fixed `'\nls '` instead would miss the final line of a CRLF stream,
-  // or a command echoed without its argument, and would silently report every build as absent.
   const lines = output.split(/\r?\n/);
-  let start = -1;
 
+  // The listing starts after the last line that names a LOCAL path, which is how every `put` progress
+  // line begins. Slicing from there rather than to it matters: searching backwards for the last
+  // listing-looking line would start mid-listing and drop whichever marker happened to come before it.
+  let start = lines.length;
   for (let i = lines.length - 1; i >= 0; i -= 1) {
-    const line = lines[i];
-    if (line === 'ls' || line.startsWith('ls ')) {
-      start = i;
+    if (/^[A-Za-z]:\\/.test(lines[i])) {
+      start = i + 1;
       break;
     }
   }
 
-  const listing = start === -1 ? '' : lines.slice(start).join('\n');
+  const listing = lines.slice(start).join('\n');
   return markers.every((marker) => new RegExp(`\\b${marker.replace('.', '\\.')}\\b`).test(listing));
 }
 

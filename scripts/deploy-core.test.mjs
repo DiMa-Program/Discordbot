@@ -215,29 +215,58 @@ describe('buildUploadScript', () => {
 });
 
 describe('buildLanded', () => {
-  const uploadLines = [
-    'C:\\staging\\dist\\features\\ranks\\sync.js | 15 KB | binary | 100%',
-    'C:\\staging\\dist\\features\\ranks\\prompt.js | 5 KB | binary | 100%',
+  // Real transfer output shape: each uploaded path, then the directory listing with no echoed
+  // command in between, because WinSCP does not echo commands run from a batch script.
+  const transfer = [
+    'C:\\staging\\dist\\features\\ranks\\role-sync.js |          10 KB |  8,0 KB/s | binary | 100%',
+    'C:\\staging\\dist\\features\\ranks\\sync.js |          15 KB | 11,5 KB/s | binary | 100%',
   ].join('\n');
 
-  it('confirms the build once the listing shows both marker files', () => {
-    expect(buildLanded(`${uploadLines}\nls\n-rw-r--r-- 1 0 0 15238 sync.js\n-rw-r--r-- 1 0 0 5431 prompt.js`)).toBe(
-      true,
-    );
+  /** The listing as WinSCP prints it: `-rw-r--r--  1 0  0  16238 Oct  1 21:07:18 2026 sync.js`. */
+  const remote = (name, size) =>
+    `-rw-r--r--    1 0        0             ${size} Oct  1 21:07:18 2026 ${name}`;
+  const dir = 'drwxr-xr-x    1 0        0              4096 Oct  1 15:51:57 2026 commands';
+
+  it('confirms the build when the listing shows both marker files', () => {
+    const output = [
+      transfer,
+      remote('sync.js', 16238),
+      remote('role-sync.js', 10664),
+      remote('prompt.js', 5431),
+      dir,
+    ].join('\n');
+
+    expect(buildLanded(output)).toBe(true);
+  });
+
+  it('reads the listing without needing an echoed ls line', () => {
+    // Anchoring on a literal `ls` line reported every build as absent, because WinSCP does not echo
+    // commands run from a script in batch mode. That false negative is what shipped.
+    const output = [transfer, remote('sync.js', 16238), remote('prompt.js', 5431), dir].join('\n');
+
+    expect(output).not.toMatch(/^ls/m);
+    expect(buildLanded(output)).toBe(true);
   });
 
   it('does not mistake role-sync.js for sync.js', () => {
     // This is the check that passed while the file it was meant to prove was genuinely absent. Every
     // build ever produced contains role-sync.js, so a substring match was always going to pass.
-    const oldBuild = `${uploadLines}\nls\n-rw-r--r-- 1 0 0 10664 role-sync.js\n-rw-r--r-- 1 0 0 8672 role-sync.js.map`;
+    const oldBuild = [
+      transfer,
+      remote('role-sync.js', 10664),
+      remote('role-sync.js.map', 6824),
+      dir,
+    ].join('\n');
 
+    expect(oldBuild).toContain('sync.js');
     expect(buildLanded(oldBuild)).toBe(false);
   });
 
   it('ignores transfer lines, which mention files that were sent, not files present', () => {
     // The put log names every local path it uploaded. Reading that as proof of remote state would
     // report success for a transfer that carried nothing.
-    expect(buildLanded(uploadLines)).toBe(false);
+    expect(transfer).toContain('sync.js');
+    expect(buildLanded(transfer)).toBe(false);
   });
 
   it('reports false when the listing is missing entirely', () => {
@@ -246,7 +275,7 @@ describe('buildLanded', () => {
   });
 
   it('requires every marker, not just one', () => {
-    const partial = 'ls\n-rw-r--r-- 1 0 0 15238 sync.js';
+    const partial = [transfer, remote('sync.js', 16238), dir].join('\n');
 
     expect(buildLanded(partial)).toBe(false);
   });
