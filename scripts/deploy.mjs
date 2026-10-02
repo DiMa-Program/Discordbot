@@ -43,6 +43,18 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { config as loadDotenv } from 'dotenv';
 
+import {
+  backupFileName,
+  buildBackupScript,
+  buildLanded,
+  buildUploadScript,
+  redact,
+  resolveHostKey,
+  restartAccepted,
+  snapshotsToPrune,
+  sftpUrl,
+} from './deploy-core.mjs';
+
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 // Load .env from the project root explicitly rather than relying on the working directory. Without
@@ -61,42 +73,18 @@ const BACKUP_HISTORY = 15;
 /**
  * Keeps the newest `BACKUP_HISTORY` copies and removes the rest.
  *
- * Named with a sortable ISO timestamp so "newest" is a string comparison rather than a stat call per
- * file. `bot.db-wal` and `bot.db-shm` share a stamp with their `bot.db` and are pruned together, so a
- * retained set is never half a WAL pair.
+ * A snapshot is pruned whole: its database, WAL and SHM files share a stamp, and deleting one of the
+ * three leaves a database whose sidecars describe a different moment.
  */
 function pruneBackups() {
   if (!existsSync(backupDir)) {
     return;
   }
 
-  const stamps = new Map();
-
-  for (const file of readdirSync(backupDir)) {
-    const match = /^bot-(.+?)(\.db(-wal|-shm)?)$/.exec(file);
-    if (match !== null) {
-      const stamp = match[1];
-      stamps.set(stamp, [...(stamps.get(stamp) ?? []), file]);
-    }
-  }
-
-  const ordered = [...stamps.keys()].sort().reverse();
-
-  for (const stamp of ordered.slice(BACKUP_HISTORY)) {
-    for (const file of stamps.get(stamp) ?? []) {
-      rmSync(path.join(backupDir, file), { force: true });
-    }
+  for (const file of snapshotsToPrune(readdirSync(backupDir), BACKUP_HISTORY)) {
+    rmSync(path.join(backupDir, file), { force: true });
   }
 }
-
-/**
- * The hosting node's SSH host key, pinned so a substituted host cannot receive the SFTP password.
- *
- * This is WinSCP's own display form: no `SHA256:` prefix and no trailing `=`. Both of those variants
- * were tried and both were rejected as a mismatch against the server's real key. Override with
- * HEAVEN_SFTP_HOST_KEY if the provider ever moves the machine.
- */
-const DEFAULT_SSH_HOST_KEY = 'ssh-ed25519 255 HjV7vEkMibVIR+NApBvRtt58JlwLERfc2fJcTjkDt2U';
 
 function git(args) {
   return execFileSync('git', args, { cwd: projectRoot, encoding: 'utf8' });
@@ -195,9 +183,9 @@ try {
 
   // Declared here, before either SFTP step, because the backup needs it too. It used to be declared
   // inside the upload section, which made the backup step throw "Cannot access 'hostKey' before
-  // initialization" â€” a Temporal Dead Zone error caught by the backup's own try/catch, so the backup
+  // initialization" — a Temporal Dead Zone error caught by the backup's own try/catch, so the backup
   // silently degraded to a warning on every single deploy.
-  const hostKey = process.env['HEAVEN_SFTP_HOST_KEY'] ?? DEFAULT_SSH_HOST_KEY;
+  const hostKey = resolveHostKey(process.env);
 
   // -------------------------------------------------------------------------------------------
   // 3. Back up the live database
@@ -237,29 +225,10 @@ try {
       { encoding: 'utf8' },
     );
 
-    const backupUrl = `sftp://${encodeURIComponent(user)}:${encodeURIComponent(password)}@${host}:${port}/`;
+    const backupUrl = sftpUrl({ user, password, host, port });
     writeFileSync(
       backupScript,
-      [
-        `open ${backupUrl} -hostkey="${hostKey}"`,
-        `option batch on`,
-        `option confirm off`,
-        // A path RELATIVE to the session root, with no `cd` and no `-filemask`, one `get` per file.
-        //
-        // Every other shape fails on this host while reporting `no such file` for files that are
-        // demonstrably present. Verified individually against the live database:
-        //   `get /home/container/data/bot.db`      absolute  -> fails
-        //   `cd /home/container` then `get data/`  with a trailing slash -> fails, "ambiguous"
-        //   `get -filemask="bot.db*" data`         filemask  -> fails
-        //   `get data/bot.db <local>`              relative  -> transfers, 20 KB
-        //
-        // The session already opens at the container home, so the relative path needs no `cd`, and
-        // naming each file sidesteps both the filemask and the trailing-slash rejection.
-        `get data/bot.db ${backupStaging}\\bot.db`,
-        `get data/bot.db-wal ${backupStaging}\\bot.db-wal`,
-        `get data/bot.db-shm ${backupStaging}\\bot.db-shm`,
-        `exit`,
-      ].join('\r\n') + '\r\n',
+      buildBackupScript({ url: backupUrl, hostKey, stagingDir: backupStaging }),
       { encoding: 'utf8' },
     );
 
@@ -281,10 +250,7 @@ try {
       const saved = [];
 
       for (const file of fetched) {
-        // The WAL and SHM sidecars belong to the snapshot above and take the same stamp. They were
-        // previously mangled into `botdb-shm` and `botdb-wal`, which lost the separator and made the
-        // sidecars look like unrelated files rather than part of one consistent snapshot.
-        const target = path.join(backupDir, file.replace(/^bot\.db/, `bot-${stamp}.db`));
+        const target = path.join(backupDir, backupFileName(file, stamp));
         copyFileSync(path.join(backupStaging, file), target);
         saved.push(path.basename(target));
       }
@@ -401,7 +367,7 @@ try {
 
   writeFileSync(iniPath, `[Configuration]\r\n[Session\\deploy]\r\n${ini}\r\n`, { encoding: 'utf8' });
 
-  const uploadUrl = `sftp://${encodeURIComponent(user)}:${encodeURIComponent(password)}@${host}:${port}/`;
+  const uploadUrl = sftpUrl({ user, password, host, port });
 
   // `-filemask="*;*/"` is what makes this recurse: `*` matches files and `*/` matches directories,
   // so a plain `put *` would upload the top level and skip everything nested under src/. WinSCP's put
@@ -424,13 +390,6 @@ try {
   // place. The stale output is deliberately NOT deleted first: doing that left the container with
   // no `dist/index.js` to boot, and since the host has no compiler it never came back. Overwriting
   // is both safer and sufficient.
-  const script = [
-    `open ${uploadUrl} -hostkey="${hostKey}"`,
-    `put -filemask="*;*/|.git" "${localSpec}" ${remoteDir}/`,
-    `ls ${remoteDir}/dist/features/ranks`,
-    'exit',
-  ].join('\r\n');
-
   // No stale-build removal here, deliberately.
   //
   // An earlier version deleted the remote `dist/` so that `index.js` would recompile on restart.
@@ -440,7 +399,11 @@ try {
   //
   // The host never needed to compile. The compiled output is now built locally and uploaded, so the
   // `put` overwrites the previous build file by file and there is nothing to clear.
-  writeFileSync(scriptPath, script + '\r\n', { encoding: 'utf8' });
+  writeFileSync(
+    scriptPath,
+    buildUploadScript({ url: uploadUrl, hostKey, localSpec, remoteDir }) + '\r\n',
+    { encoding: 'utf8' },
+  );
 
   console.log(`[deploy] ${branch} @ ${shortSha}`);
   console.log(`[deploy] uploading to ${remoteDir} ...`);
@@ -450,7 +413,7 @@ try {
     windowsHide: true,
   });
 
-  const output = (put.stdout ?? '').split(password).join('<redacted>');
+  const output = redact(put.stdout ?? '', password);
   if (put.status !== 0) {
     if (output.trim() !== '') console.error(output.trim());
     if (put.stderr !== undefined && put.stderr.trim() !== '') console.error(put.stderr.trim());
@@ -473,14 +436,7 @@ try {
   // is the only trustworthy signal that the new build arrived: the transfer itself succeeds whether
   // or not it carried the compiled output, and the previous version of this script reported success
   // while the host kept an hours-old build indefinitely.
-  //
-  // The word boundary matters. A bare `includes('sync.js')` also matches `role-sync.js`, which the
-  // previous build contained, so the check passed while `sync.js` was genuinely absent. An earlier
-  // attempt matched both `sync.js` and `prompt.js` and still reported success, which is a reminder
-  // that a verification derived from the wrong evidence is worse than no verification at all.
-  const listing = output.slice(output.indexOf('\nls ') === -1 ? 0 : output.indexOf('\nls '));
-  const landed = /\bsync\.js\b/.test(listing) && /\bprompt\.js\b/.test(listing);
-  if (landed) {
+  if (buildLanded(output)) {
     console.log('[deploy] the host now holds the new build.');
   } else {
     console.log('[deploy] WARNING: the host does not show the new build after the upload.');
@@ -502,7 +458,7 @@ try {
       body: JSON.stringify({ signal: 'restart' }),
     });
 
-    if (power.ok || power.status === 409) {
+    if (restartAccepted(power)) {
       console.log('[deploy] restart requested.');
     } else {
       console.log(`[deploy] uploaded, but the restart returned HTTP ${power.status}.`);
