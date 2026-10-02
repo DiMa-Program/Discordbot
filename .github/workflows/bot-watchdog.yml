@@ -40,6 +40,11 @@ jobs:
             const SERVER_ID = process.env.SERVER_ID;
             const KEY = process.env.PANEL_KEY;
 
+            // Reported unconditionally, and never the value. Whether the secret resolved is the
+            // first question whenever this job goes red, and an unreadable log is a bad place to
+            // have to answer it.
+            core.info(`panel key present: ${KEY ? `yes (${KEY.length} chars)` : 'no'}`);
+
             if (!KEY) {
               // Failing loudly beats a watchdog that silently never runs. A missing secret looks
               // exactly like a healthy instance from the outside, which is the failure this job
@@ -80,6 +85,8 @@ jobs:
             } catch (error) {
               detail = `resources request failed: ${error.message}`;
             }
+
+            core.info(`liveness probe: ${detail}`);
 
             if (healthy) {
               core.info(`Instance is up (${detail}). Nothing to do.`);
