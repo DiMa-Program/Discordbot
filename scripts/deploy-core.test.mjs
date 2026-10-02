@@ -28,8 +28,11 @@ import {
   buildBackupScript,
   buildLanded,
   buildUploadScript,
+  buildVerifyScript,
   DATABASE_FILES,
   DEFAULT_SSH_HOST_KEY,
+  ENTRYPOINT,
+  entrypointMatches,
   redact,
   resourcesReportHealthy,
   resolveHostKey,
@@ -278,6 +281,54 @@ describe('buildLanded', () => {
     const partial = [transfer, remote('sync.js', 16238), dir].join('\n');
 
     expect(buildLanded(partial)).toBe(false);
+  });
+});
+
+describe('buildVerifyScript', () => {
+  const script = buildVerifyScript({
+    url: 'sftp://u:p@h:2022/',
+    hostKey: 'KEY',
+    remoteDir: '/home/container',
+    localPath: 'C:\\verify\\index.js',
+  });
+
+  it('fetches the entrypoint, since every code path runs through it', () => {
+    expect(script).toContain(`get /home/container/${ENTRYPOINT} C:\\verify\\index.js`);
+  });
+
+  it('keeps the local destination native, for the same reason the backup does', () => {
+    expect(script).not.toMatch(/^get \S*[A-Za-z]:\//m);
+  });
+
+  it('is pinned and unattended', () => {
+    expect(script).toContain('-hostkey="KEY"');
+    expect(script).toContain('option batch on');
+  });
+});
+
+describe('entrypointMatches', () => {
+  const hash = 'a'.repeat(64);
+
+  it('accepts an entrypoint that is byte-identical', () => {
+    expect(entrypointMatches(hash, hash)).toBe(true);
+  });
+
+  it('rejects a stale entrypoint, which is the whole point of the check', () => {
+    // A name-based check stayed green through an entire pipeline that never once replaced this file.
+    // Only a content comparison can tell a fresh build from a stale one.
+    expect(entrypointMatches(hash, 'b'.repeat(64))).toBe(false);
+  });
+
+  it('rejects a missing or unreadable hash rather than assuming a match', () => {
+    // `undefined !== undefined` is true, so an absent remote file would otherwise read as verified.
+    expect(entrypointMatches(hash, undefined)).toBe(false);
+    expect(entrypointMatches(undefined, undefined)).toBe(false);
+    expect(entrypointMatches(hash, '')).toBe(false);
+    expect(entrypointMatches('', '')).toBe(false);
+  });
+
+  it('does not accept an empty local hash', () => {
+    expect(entrypointMatches('', hash)).toBe(false);
   });
 });
 

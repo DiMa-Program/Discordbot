@@ -173,6 +173,51 @@ export function buildUploadScript({ url, hostKey, localSpec, remoteDir }) {
  */
 export const BUILD_MARKER_FILES = Object.freeze(['sync.js', 'prompt.js']);
 
+/**
+ * The file whose content proves the uploaded build is the one that was just compiled.
+ *
+ * `dist/index.js` is the process entrypoint, so every code path that matters runs through it. The
+ * markers are not enough on their own: they have existed on the host since an earlier deploy, so
+ * their presence is satisfied by any build from that point on, including a stale one.
+ */
+export const ENTRYPOINT = 'dist/index.js';
+
+/**
+ * Whether the entrypoint the host returned is byte-identical to the one that was just built.
+ *
+ * This is the difference between "a file called sync.js is there" and "the code I compiled is
+ * running". Only the second is worth anything, and the first is what shipped: a name-based check
+ * stayed green through an entire deploy pipeline that never once replaced the entrypoint, so the bot
+ * ran the first build it ever received for the life of the project.
+ *
+ * Compared by hash rather than by size or timestamp. Two builds of the same source are the same
+ * artifact and should pass; any difference in the entrypoint means the host will run different code.
+ */
+export function entrypointMatches(localHash, remoteHash) {
+  return (
+    typeof localHash === 'string' &&
+    typeof remoteHash === 'string' &&
+    localHash.length > 0 &&
+    localHash === remoteHash
+  );
+}
+
+/**
+ * The `get` command that fetches the entrypoint back for hashing.
+ *
+ * Relative path and an explicit file name, for the same reasons the backup transfer needs them: this
+ * server rejects an absolute remote path, and the local side must keep native separators.
+ */
+export function buildVerifyScript({ url, hostKey, remoteDir, localPath }) {
+  return [
+    `open ${url} -hostkey="${hostKey}"`,
+    'option batch on',
+    'option confirm off',
+    `get ${remoteDir}/${ENTRYPOINT} ${localPath}`,
+    'exit',
+  ].join('\r\n') + '\r\n';
+}
+
 // ---------------------------------------------------------------------------------------------
 // Reading the upload result
 // ---------------------------------------------------------------------------------------------

@@ -28,6 +28,7 @@
  * Usage: npm run deploy
  */
 
+import { createHash } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import {
   copyFileSync,
@@ -36,6 +37,7 @@ import {
   mkdirSync,
   readdirSync,
   rmSync,
+  readFileSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -48,6 +50,9 @@ import {
   buildBackupScript,
   buildLanded,
   buildUploadScript,
+  buildVerifyScript,
+  ENTRYPOINT,
+  entrypointMatches,
   redact,
   resolveHostKey,
   restartAccepted,
@@ -437,10 +442,75 @@ try {
   // or not it carried the compiled output, and the previous version of this script reported success
   // while the host kept an hours-old build indefinitely.
   if (buildLanded(output)) {
-    console.log('[deploy] the host now holds the new build.');
+    console.log('[deploy] the host lists the new build.');
   } else {
-    console.log('[deploy] WARNING: the host does not show the new build after the upload.');
-    console.log('[deploy]   The restart below will bring up the previous build.');
+    console.log('[deploy] WARNING: the host listing does not show the new build.');
+    console.log('[deploy]   Continuing to the content check, which is authoritative.');
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // 5b. Prove the host is running this build, by content
+  // -------------------------------------------------------------------------------------------
+  //
+  // The listing above only proves that files with certain names exist. Those names have been present
+  // on the host since an earlier deploy, so the check is satisfied by a stale build as readily as by
+  // a fresh one. It is a smoke signal, not evidence.
+  //
+  // The entrypoint is fetched back and hashed. `dist/index.js` is the file every code path runs
+  // through, so a hash mismatch means the container will boot different code than the one just
+  // compiled, and saying so is the entire point: a deploy that cannot prove what it shipped has not
+  // reported anything useful.
+  //
+  // This is what a name-based check cannot do. The pipeline once ran an entire project without ever
+  // replacing this file, and every check along the way stayed green.
+  const verifyStaging = path.join(projectRoot, 'dist-package', 'verify-download');
+  rmSync(verifyStaging, { recursive: true, force: true });
+  mkdirSync(verifyStaging, { recursive: true });
+
+  const localEntry = path.join(builtDist, 'index.js');
+  const localHash = createHash('sha256').update(readFileSync(localEntry)).digest('hex');
+  const remoteEntry = path.join(verifyStaging, 'index.js');
+
+  try {
+    const verifyIni = path.join(tmpdir(), `winscp-verify-${process.pid}.ini`);
+    const verifyScript = path.join(tmpdir(), `winscp-verify-${process.pid}.txt`);
+
+    writeFileSync(
+      verifyIni,
+      `[Configuration]\r\n[Session\\verify]\r\nHostName=${host}\r\nPortNumber=${port}\r\nUserName=${user}\r\nProtocol=SFTP\r\nPuttyProtocol=putty-sftp\r\nTimeout=30\r\n`,
+      { encoding: 'utf8' },
+    );
+    writeFileSync(
+      verifyScript,
+      buildVerifyScript({ url: uploadUrl, hostKey, remoteDir, localPath: remoteEntry }),
+      { encoding: 'utf8' },
+    );
+
+    spawnSync(winscp, ['/ini=' + verifyIni, '/script=' + verifyScript], {
+      encoding: 'utf8',
+      windowsHide: true,
+    });
+
+    rmSync(verifyIni, { force: true });
+    rmSync(verifyScript, { force: true });
+
+    if (!existsSync(remoteEntry)) {
+      console.log('[deploy] WARNING: could not read the host entrypoint back, so it is unverified.');
+      console.log('[deploy]   The upload reported success; treat the deployed code as unknown.');
+    } else {
+      const remoteHash = createHash('sha256').update(readFileSync(remoteEntry)).digest('hex');
+
+      if (entrypointMatches(localHash, remoteHash)) {
+        console.log(`[deploy] entrypoint verified on the host (sha256 ${localHash.slice(0, 12)}).`);
+      } else {
+        console.log('[deploy] WARNING: the host entrypoint differs from the build just compiled.');
+        console.log(`[deploy]   local  sha256 ${localHash}`);
+        console.log(`[deploy]   remote sha256 ${remoteHash}`);
+        console.log('[deploy]   The restart below will bring up DIFFERENT code than this deploy built.');
+      }
+    }
+  } finally {
+    rmSync(verifyStaging, { recursive: true, force: true });
   }
 
   // -------------------------------------------------------------------------------------------
@@ -496,3 +566,4 @@ try {
   execFileSync('git', ['worktree', 'prune'], { cwd: projectRoot, stdio: 'ignore' });
   rmSync(path.dirname(stagingDir), { recursive: true, force: true });
 }
+

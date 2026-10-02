@@ -15,7 +15,13 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { backupFileName, buildBackupScript, buildLanded, snapshotsToPrune } from './deploy-core.mjs';
+import {
+  backupFileName,
+  buildBackupScript,
+  buildLanded,
+  entrypointMatches,
+  snapshotsToPrune,
+} from './deploy-core.mjs';
 
 const CREDENTIALS = { url: 'sftp://u:p@h:2022/', hostKey: 'KEY', stagingDir: 'C:\\staging' };
 
@@ -82,6 +88,31 @@ describe('the build check rejects what shipped', () => {
 
   it('rejects a listing that never ran', () => {
     expect(buildLanded('ls failed: no such directory')).toBe(false);
+  });
+});
+
+describe('the name-based listing cannot stand in for a content check', () => {
+  it('accepts a build that has merely not been replaced', () => {
+    // `sync.js` and `prompt.js` have been on the host since an earlier deploy, so the listing is
+    // satisfied by any build from that point on. It stayed green through a pipeline that never once
+    // replaced the entrypoint, which is why the bot ran its first build for the entire life of the
+    // project with every check reporting success.
+    const listing = [
+      'C:\\staging\\dist\\features\\ranks\\sync.js |          15 KB | 11,5 KB/s | binary | 100%',
+      '-rw-r--r--    1 0        0             16238 Oct  1 21:07:18 2026 sync.js',
+      '-rw-r--r--    1 0        0              5431 Oct  1 21:07:11 2026 prompt.js',
+      'drwxr-xr-x    1 0        0              4096 Oct  1 15:51:57 2026 commands',
+    ].join('\n');
+
+    expect(buildLanded(listing)).toBe(true);
+  });
+
+  it('so the entrypoint hash is what actually decides', () => {
+    const local = 'a'.repeat(64);
+    const stale = 'b'.repeat(64);
+
+    expect(entrypointMatches(local, local)).toBe(true);
+    expect(entrypointMatches(local, stale)).toBe(false);
   });
 });
 
